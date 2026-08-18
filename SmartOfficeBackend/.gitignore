@@ -1,0 +1,5 @@
+.venv/
+__pycache__/
+*.py[cod]
+smart_office.db
+.pytest_cache/
