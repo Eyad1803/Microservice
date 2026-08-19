@@ -3,7 +3,7 @@
 // Temporary diagnostic switch:
 //   1 = compile only the exact standalone Fingerprint.ino test below.
 //   0 = compile/run the complete Smart Office Access System.
-#define FINGERPRINT_ONLY_DEBUG 1
+#define FINGERPRINT_ONLY_DEBUG 0
 
 // Servo isolation uses the working servo_test.ino attach/write sequence, but
 // keeps GPIO13 because GPIO18 is already the RC522 SCK pin in the full project.
@@ -127,6 +127,7 @@ void loop() {
 #define BUZZER_PIN 26
 #define GREEN_LED_PIN 32
 #define SERVO_PIN 13
+#define SERVO_USE_SIMPLE_ATTACH 1
 #define ULTRASONIC_TRIG_PIN 33
 #define ULTRASONIC_ECHO_PIN 34
 
@@ -220,6 +221,19 @@ User users[] = {
 
 constexpr size_t USER_COUNT = sizeof(users) / sizeof(users[0]);
 
+struct AccessControlStateSnapshot {
+  Area selectedArea;
+  AccessMode currentMode;
+  bool systemLocked;
+  bool adminMode;
+  int failedAttempts;
+  unsigned long adminModeStartTime;
+  bool waitingForEnrollmentID;
+  bool doorOpen;
+  unsigned long doorOpenedAt;
+  uint16_t insideMasks[USER_COUNT];
+};
+
 MFRC522 rfid(RFID_SS_PIN, RFID_RST_PIN);
 HardwareSerial fingerprintSerial(2);
 Adafruit_Fingerprint finger = Adafruit_Fingerprint(&fingerprintSerial);
@@ -276,6 +290,13 @@ void loopServoOnlyDebug();
 void printMenu();
 void printSystemStatus();
 void printHardwareSelfTest();
+void runHardwareReadinessCheck();
+AccessControlStateSnapshot captureAccessControlState();
+bool isAccessControlStateUnchanged(
+    const AccessControlStateSnapshot& snapshot);
+void restoreAccessControlState(const AccessControlStateSnapshot& snapshot);
+bool isStateGuardedDiagnosticCommand(char command);
+void runStateGuardedDiagnostic(char command);
 bool validatePinAssignments();
 void runSoftwareValidation();
 
@@ -367,6 +388,7 @@ void checkRFID();
 String readRFIDUID();
 
 void setupFingerprint();
+bool runFingerprintStandaloneStyleTest();
 bool setupFingerprintWithBaudScan();
 bool initializeFingerprintAtBaud(uint32_t baudRate);
 void printFingerprintParameters();
@@ -386,6 +408,10 @@ int getAreaBit(Area area);
 bool isUserInsideArea(User* user, Area area);
 void markUserInsideArea(User* user, Area area);
 void markUserOutsideArea(User* user, Area area);
+bool commitAttendanceAfterDoorOpen(User* user,
+                                   Area area,
+                                   AccessMode accessMode,
+                                   bool isDoorOpen);
 bool canUserEnterArea(User* user, Area area);
 bool canUserExitArea(User* user, Area area);
 void handleEntryAccess(User* user, Area area);
@@ -991,16 +1017,23 @@ void setupDoorServo() {
    * servo supply, connect its GND to ESP32 GND, and measure the voltage.
    * The AS608 may draw about 120 mA and a moving servo can draw much more.
    */
+  int servoPwmChannel = -1;
+#if SERVO_USE_SIMPLE_ATTACH
+  // Match the working servo_test.ino attach pattern on the conflict-free
+  // project pin. GPIO18 remains reserved for the RC522 SCK signal.
+  servoPwmChannel = doorServo.attach(SERVO_PIN);
+#else
   ESP32PWM::allocateTimer(0);
   doorServo.setPeriodHertz(50);
-  const int servoPwmChannel = doorServo.attach(SERVO_PIN, 500, 2400);
+  servoPwmChannel = doorServo.attach(SERVO_PIN, 500, 2400);
+#endif
   // Channel 0 is valid. Use attached() instead of treating a zero-valued
   // channel number as failure.
   servoInitialized = doorServo.attached();
 
   if (!servoInitialized) {
     doorOpen = false;
-    Serial.println("[SERVO] Failed to attach a 50 Hz PWM signal on GPIO 13.");
+    Serial.println("[SERVO] Failed to attach PWM on GPIO 13.");
     Serial.println("This is a PWM setup failure, not software detection of the motor.");
     return;
   }
@@ -1009,7 +1042,13 @@ void setupDoorServo() {
   doorOpen = false;
   doorOpenedAt = 0;
   delay(300);
-  Serial.println("[SERVO] 50 Hz PWM attached on GPIO 13.");
+  Serial.print("[SERVO] Attach mode: ");
+#if SERVO_USE_SIMPLE_ATTACH
+  Serial.println("simple attach (working servo_test.ino pattern)");
+#else
+  Serial.println("advanced 50 Hz / 500-2400 us");
+#endif
+  Serial.println("[SERVO] PWM attached on GPIO 13.");
   Serial.print("[SERVO] PWM channel: ");
   Serial.println(servoPwmChannel);
   Serial.println("[SERVO] Closed-angle command sent: 0 degrees.");
@@ -1208,7 +1247,8 @@ void updatePresencePrompt() {
 void testDoor() {
   Serial.println();
   Serial.println("[SERVO TEST]");
-  Serial.print("Signal pin: GPIO ");
+  Serial.println("Library: ESP32Servo");
+  Serial.print("Servo signal pin: GPIO");
   Serial.println(SERVO_PIN);
 
   if (systemLocked) {
@@ -1558,6 +1598,7 @@ void printMenu() {
   Serial.println("X = Exit Mode");
   Serial.println("D = Test Servo Door");
   Serial.println("U = Test Ultrasonic Sensor (10 readings)");
+  Serial.println("W = Run non-destructive hardware readiness check");
   Serial.println();
 }
 
@@ -1644,8 +1685,147 @@ void printHardwareSelfTest() {
                  lcdInitialized ? "LCD: OK" : "LCD: FAIL");
 }
 
+AccessControlStateSnapshot captureAccessControlState() {
+  AccessControlStateSnapshot snapshot;
+  snapshot.selectedArea = selectedArea;
+  snapshot.currentMode = currentMode;
+  snapshot.systemLocked = systemLocked;
+  snapshot.adminMode = adminMode;
+  snapshot.failedAttempts = failedAttempts;
+  snapshot.adminModeStartTime = adminModeStartTime;
+  snapshot.waitingForEnrollmentID = waitingForEnrollmentID;
+  snapshot.doorOpen = doorOpen;
+  snapshot.doorOpenedAt = doorOpenedAt;
+  for (size_t i = 0; i < USER_COUNT; ++i) {
+    snapshot.insideMasks[i] = users[i].insideMask;
+  }
+  return snapshot;
+}
+
+bool isAccessControlStateUnchanged(
+    const AccessControlStateSnapshot& snapshot) {
+  bool unchanged = selectedArea == snapshot.selectedArea &&
+                   currentMode == snapshot.currentMode &&
+                   systemLocked == snapshot.systemLocked &&
+                   adminMode == snapshot.adminMode &&
+                   failedAttempts == snapshot.failedAttempts &&
+                   adminModeStartTime == snapshot.adminModeStartTime &&
+                   waitingForEnrollmentID == snapshot.waitingForEnrollmentID &&
+                   doorOpen == snapshot.doorOpen &&
+                   doorOpenedAt == snapshot.doorOpenedAt;
+  for (size_t i = 0; i < USER_COUNT; ++i) {
+    unchanged &= users[i].insideMask == snapshot.insideMasks[i];
+  }
+  return unchanged;
+}
+
+void restoreAccessControlState(const AccessControlStateSnapshot& snapshot) {
+  selectedArea = snapshot.selectedArea;
+  currentMode = snapshot.currentMode;
+  systemLocked = snapshot.systemLocked;
+  adminMode = snapshot.adminMode;
+  failedAttempts = snapshot.failedAttempts;
+  adminModeStartTime = snapshot.adminModeStartTime;
+  waitingForEnrollmentID = snapshot.waitingForEnrollmentID;
+  doorOpen = snapshot.doorOpen;
+  doorOpenedAt = snapshot.doorOpenedAt;
+  for (size_t i = 0; i < USER_COUNT; ++i) {
+    users[i].insideMask = snapshot.insideMasks[i];
+  }
+}
+
+bool isStateGuardedDiagnosticCommand(char command) {
+  return command == 'F' || command == 'P' || command == 'D' ||
+         command == 'U' || command == 'W';
+}
+
+void runHardwareReadinessCheck() {
+  AccessControlStateSnapshot savedState = captureAccessControlState();
+
+  Serial.println();
+  Serial.println("[HARDWARE READINESS CHECK]");
+  Serial.println("This check does not move the servo or make access decisions.");
+  Serial.println();
+
+  bool fingerprintOK = runFingerprintStandaloneStyleTest();
+  printUltrasonicStatus();
+  bool ultrasonicOK = ultrasonicHasMeasurement && lastDistanceCm > 0.0;
+  bool gpioOK = validatePinAssignments();
+
+  bool accessStateUnchanged = isAccessControlStateUnchanged(savedState);
+
+  // Enforce W's non-destructive contract even if a future diagnostic is
+  // accidentally changed. Hardware status variables remain updated.
+  restoreAccessControlState(savedState);
+
+  bool ready = fingerprintOK && ultrasonicOK && servoInitialized &&
+               rfidInitialized && lcdInitialized && gpioOK &&
+               accessStateUnchanged;
+
+  Serial.println();
+  Serial.println("[HARDWARE READINESS SUMMARY]");
+  Serial.print("Fingerprint: ");
+  Serial.println(fingerprintOK ? "OK" : "FAIL");
+  Serial.print("Ultrasonic: ");
+  Serial.println(ultrasonicOK ? "OK" : "FAIL / Timeout");
+  Serial.print("Servo pin configured: GPIO");
+  Serial.println(SERVO_PIN);
+  Serial.print("Servo PWM attached: ");
+  Serial.println(servoInitialized ? "YES" : "NO");
+  Serial.println("Servo movement test: use D");
+  Serial.print("RFID: ");
+  Serial.println(rfidInitialized ? "OK" : "FAIL");
+  Serial.print("LCD 20x4: ");
+  Serial.println(lcdInitialized ? "OK" : "FAIL");
+  Serial.print("GPIO conflicts: ");
+  Serial.println(gpioOK ? "none" : "FOUND");
+  Serial.print("Access/security state unchanged: ");
+  Serial.println(accessStateUnchanged ? "YES" : "NO - state restored");
+  Serial.println("Power warning: verify regulated 5V, safe logic levels, and common GND.");
+  Serial.print("Result: ");
+  Serial.println(ready ? "READY" : "NOT READY");
+  Serial.println();
+
+  lcdShowMessage("HW READINESS",
+                 fingerprintOK ? "Finger: OK" : "Finger: FAIL",
+                 ultrasonicOK ? "Ultra: OK" : "Ultra: FAIL",
+                 ready ? "READY" : "NOT READY");
+}
+
+void runStateGuardedDiagnostic(char command) {
+  if (!isStateGuardedDiagnosticCommand(command)) {
+    return;
+  }
+
+  AccessControlStateSnapshot savedState = captureAccessControlState();
+  switch (command) {
+    case 'F':
+      runFingerprintStandaloneStyleTest();
+      break;
+    case 'P':
+      testSimpleFingerprintScan();
+      break;
+    case 'D':
+      testDoor();
+      break;
+    case 'U':
+      printUltrasonicStatus();
+      break;
+    case 'W':
+      runHardwareReadinessCheck();
+      break;
+  }
+
+  if (!isAccessControlStateUnchanged(savedState)) {
+    restoreAccessControlState(savedState);
+    Serial.println("[DIAGNOSTIC STATE GUARD]");
+    Serial.println("ERROR: Diagnostic attempted to change access-control state.");
+    Serial.println("Original attendance and security state restored.");
+  }
+}
+
 void runSoftwareValidation() {
-  constexpr int MAX_STORED_VALIDATION_FAILURES = 70;
+  constexpr int MAX_STORED_VALIDATION_FAILURES = 100;
   String failedDetails[MAX_STORED_VALIDATION_FAILURES];
   int totalTests = 0;
   int passedTests = 0;
@@ -1662,9 +1842,16 @@ void runSoftwareValidation() {
   bool savedAdminMode = adminMode;
   int savedFailedAttempts = failedAttempts;
   unsigned long savedAdminModeStartTime = adminModeStartTime;
+  Area savedSelectedArea = selectedArea;
   AccessMode savedCurrentMode = currentMode;
   bool savedWaitingForEnrollmentID = waitingForEnrollmentID;
+  bool savedDoorOpen = doorOpen;
+  unsigned long savedDoorOpenedAt = doorOpenedAt;
+  float savedLastDistanceCm = lastDistanceCm;
+  unsigned long savedLastUltrasonicCheckAt = lastUltrasonicCheckAt;
+  bool savedUltrasonicHasMeasurement = ultrasonicHasMeasurement;
   bool savedPresencePromptVisible = presencePromptVisible;
+  unsigned long savedLastLCDMessageAt = lastLCDMessageAt;
   String savedLcdLine1 = lastLcdLine1;
   String savedLcdLine2 = lastLcdLine2;
   String savedLcdLine3 = lastLcdLine3;
@@ -1752,6 +1939,49 @@ void runSoftwareValidation() {
            regularEmployeesDeniedServer,
            "all denied",
            "at least one allowed");
+  bool regularEmployeesDeniedManagement =
+      !checkPermission(employeeA, MANAGEMENT_ADMIN) &&
+      !checkPermission(employeeB, MANAGEMENT_ADMIN) &&
+      !checkPermission(employeeC, MANAGEMENT_ADMIN) &&
+      !checkPermission(employeeD, MANAGEMENT_ADMIN);
+  validate("Regular employees cannot access Management/Admin",
+           regularEmployeesDeniedManagement,
+           "all denied",
+           "at least one allowed");
+  validate("Employee A is denied Companies B/C/D",
+           !checkPermission(employeeA, COMPANY_B) &&
+               !checkPermission(employeeA, COMPANY_C) &&
+               !checkPermission(employeeA, COMPANY_D),
+           "all denied",
+           "at least one allowed");
+  validate("Employee B is denied Companies A/C/D",
+           !checkPermission(employeeB, COMPANY_A) &&
+               !checkPermission(employeeB, COMPANY_C) &&
+               !checkPermission(employeeB, COMPANY_D),
+           "all denied",
+           "at least one allowed");
+  validate("Employee C is denied Companies A/B/D",
+           !checkPermission(employeeC, COMPANY_A) &&
+               !checkPermission(employeeC, COMPANY_B) &&
+               !checkPermission(employeeC, COMPANY_D),
+           "all denied",
+           "at least one allowed");
+  validate("Employee D is denied Companies A/B/C",
+           !checkPermission(employeeD, COMPANY_A) &&
+               !checkPermission(employeeD, COMPANY_B) &&
+               !checkPermission(employeeD, COMPANY_C),
+           "all denied",
+           "at least one allowed");
+  validate("IT Admin is limited to Main Entrance and Server Room",
+           checkPermission(itAdmin, MAIN_ENTRANCE) &&
+               checkPermission(itAdmin, SERVER_ROOM) &&
+               !checkPermission(itAdmin, COMPANY_A) &&
+               !checkPermission(itAdmin, COMPANY_B) &&
+               !checkPermission(itAdmin, COMPANY_C) &&
+               !checkPermission(itAdmin, COMPANY_D) &&
+               !checkPermission(itAdmin, MANAGEMENT_ADMIN),
+           "Main + Server only",
+           "permission profile mismatch");
 
   const Area allAreas[] = {MAIN_ENTRANCE,
                            COMPANY_A,
@@ -1761,6 +1991,17 @@ void runSoftwareValidation() {
                            COMPANY_C,
                            COMPANY_D};
   constexpr size_t allAreaCount = sizeof(allAreas) / sizeof(allAreas[0]);
+  bool allUsersStartOutside = true;
+  for (size_t userIndex = 0; userIndex < USER_COUNT; ++userIndex) {
+    for (size_t areaIndex = 0; areaIndex < allAreaCount; ++areaIndex) {
+      allUsersStartOutside &=
+          !isUserInsideArea(&users[userIndex], allAreas[areaIndex]);
+    }
+  }
+  validate("All users start OUTSIDE every area",
+           allUsersStartOutside,
+           "all OUTSIDE",
+           "at least one INSIDE");
   bool managerAllowedEverywhere = true;
   for (size_t i = 0; i < allAreaCount; ++i) {
     managerAllowedEverywhere &= checkPermission(manager, allAreas[i]);
@@ -1854,6 +2095,49 @@ void runSoftwareValidation() {
            canUserEnterArea(employeeA, COMPANY_A),
            "entry allowed",
            "entry denied");
+  if (employeeA != nullptr) {
+    employeeA->insideMask = 0;
+  }
+  bool entryCommittedWhileClosed =
+      commitAttendanceAfterDoorOpen(employeeA,
+                                    COMPANY_A,
+                                    MODE_ENTRY,
+                                    false);
+  validate("Entry does not mark INSIDE while door software state is CLOSED",
+           !entryCommittedWhileClosed &&
+               !isUserInsideArea(employeeA, COMPANY_A),
+           "unchanged OUTSIDE",
+           "attendance changed");
+  bool entryCommittedAfterOpen =
+      commitAttendanceAfterDoorOpen(employeeA,
+                                    COMPANY_A,
+                                    MODE_ENTRY,
+                                    true);
+  validate("Entry marks INSIDE only after door software state is OPEN",
+           entryCommittedAfterOpen &&
+               isUserInsideArea(employeeA, COMPANY_A),
+           "INSIDE after OPEN",
+           "attendance not committed correctly");
+  bool exitCommittedWhileClosed =
+      commitAttendanceAfterDoorOpen(employeeA,
+                                    COMPANY_A,
+                                    MODE_EXIT,
+                                    false);
+  validate("Exit does not mark OUTSIDE while door software state is CLOSED",
+           !exitCommittedWhileClosed &&
+               isUserInsideArea(employeeA, COMPANY_A),
+           "unchanged INSIDE",
+           "attendance changed");
+  bool exitCommittedAfterOpen =
+      commitAttendanceAfterDoorOpen(employeeA,
+                                    COMPANY_A,
+                                    MODE_EXIT,
+                                    true);
+  validate("Exit marks OUTSIDE only after door software state is OPEN",
+           exitCommittedAfterOpen &&
+               !isUserInsideArea(employeeA, COMPANY_A),
+           "OUTSIDE after OPEN",
+           "attendance not committed correctly");
   validate("Duplicate entry counts as a failed attempt",
            COUNT_ANTI_PASSBACK_AS_FAILED_ATTEMPT,
            "true",
@@ -2041,13 +2325,57 @@ void runSoftwareValidation() {
            failedAttempts == 1,
            "1",
            String(failedAttempts));
+  AccessControlStateSnapshot diagnosticState = captureAccessControlState();
+  validate("F/P/D/U diagnostics and Hardware readiness W use the state guard",
+           isStateGuardedDiagnosticCommand('F') &&
+               isStateGuardedDiagnosticCommand('P') &&
+               isStateGuardedDiagnosticCommand('D') &&
+               isStateGuardedDiagnosticCommand('U') &&
+               isStateGuardedDiagnosticCommand('W'),
+           "all guarded",
+           "one or more unguarded");
+  selectedArea = selectedArea == COMPANY_A ? COMPANY_B : COMPANY_A;
+  validate("Diagnostic state guard detects selected-area changes",
+           !isAccessControlStateUnchanged(diagnosticState),
+           "change detected",
+           "change missed");
+  restoreAccessControlState(diagnosticState);
+  validate("Diagnostic state guard restores selected area and security state",
+           isAccessControlStateUnchanged(diagnosticState),
+           "state restored",
+           "state mismatch");
+  users[0].insideMask ^= static_cast<uint16_t>(getAreaBit(MAIN_ENTRANCE));
+  validate("Diagnostic state guard detects attendance changes",
+           !isAccessControlStateUnchanged(diagnosticState),
+           "change detected",
+           "change missed");
+  restoreAccessControlState(diagnosticState);
+  validate("Diagnostic state guard restores attendance masks",
+           isAccessControlStateUnchanged(diagnosticState),
+           "attendance restored",
+           "attendance mismatch");
   validate("Ultrasonic pulse timeout is finite",
            ULTRASONIC_ECHO_TIMEOUT_US == 30000,
            "30000 us",
            String(ULTRASONIC_ECHO_TIMEOUT_US) + " us");
 
-  const char serialCommands[] = {'E', 'R', 'P', 'X', 'M', 'S',
-                                 'T', 'G', 'D', 'U', 'F', 'V'};
+  validate("Fingerprint integration uses UART2 GPIO16/17 at 57600",
+           FINGER_RX_PIN == 16 && FINGER_TX_PIN == 17 &&
+               FINGERPRINT_PRIMARY_BAUD == 57600,
+           "RX16/TX17/57600",
+           "fingerprint transport mismatch");
+  validate("Servo uses project GPIO13 instead of RFID SCK GPIO18",
+           SERVO_PIN == 13 && RFID_SCK_PIN == 18 &&
+               SERVO_PIN != RFID_SCK_PIN,
+           "Servo 13, RFID SCK 18",
+           "pin mismatch or conflict");
+  validate("Servo simple attach mode matches the working standalone test",
+           SERVO_USE_SIMPLE_ATTACH == 1,
+           "enabled",
+           "disabled");
+
+  const char serialCommands[] = {'E', 'R', 'P', 'X', 'M', 'S', 'T',
+                                 'G', 'D', 'U', 'F', 'V', 'W'};
   constexpr size_t serialCommandCount =
       sizeof(serialCommands) / sizeof(serialCommands[0]);
   bool serialCommandsUnique = true;
@@ -2083,9 +2411,16 @@ void runSoftwareValidation() {
   adminMode = savedAdminMode;
   failedAttempts = savedFailedAttempts;
   adminModeStartTime = savedAdminModeStartTime;
+  selectedArea = savedSelectedArea;
   currentMode = savedCurrentMode;
   waitingForEnrollmentID = savedWaitingForEnrollmentID;
+  doorOpen = savedDoorOpen;
+  doorOpenedAt = savedDoorOpenedAt;
+  lastDistanceCm = savedLastDistanceCm;
+  lastUltrasonicCheckAt = savedLastUltrasonicCheckAt;
+  ultrasonicHasMeasurement = savedUltrasonicHasMeasurement;
   presencePromptVisible = savedPresencePromptVisible;
+  lastLCDMessageAt = savedLastLCDMessageAt;
   lastLcdLine1 = savedLcdLine1;
   lastLcdLine2 = savedLcdLine2;
   lastLcdLine3 = savedLcdLine3;
@@ -2260,36 +2595,62 @@ void setupFingerprint() {
   setupFingerprintWithBaudScan();
 }
 
-bool setupFingerprintWithBaudScan() {
+bool runFingerprintStandaloneStyleTest() {
   fingerprintReady = false;
   fingerprintWorkingBaud = 0;
+
+  Serial.println();
+  Serial.println("=== AS608 Fingerprint Test ===");
+  Serial.println("Using HardwareSerial(2)");
+  Serial.print("RX: GPIO");
+  Serial.println(FINGER_RX_PIN);
+  Serial.print("TX: GPIO");
+  Serial.println(FINGER_TX_PIN);
+  Serial.print("Baud: ");
+  Serial.println(FINGERPRINT_PRIMARY_BAUD);
+
+  // Exact low-level order from the working Fingerprint.ino test:
+  // UART2 begin -> finger.begin(57600) -> verifyPassword().
+  fingerprintSerial.begin(FINGERPRINT_PRIMARY_BAUD,
+                          SERIAL_8N1,
+                          FINGER_RX_PIN,
+                          FINGER_TX_PIN);
+  Serial.println("Checking fingerprint sensor...");
+  finger.begin(FINGERPRINT_PRIMARY_BAUD);
+
+  if (!finger.verifyPassword()) {
+    Serial.println("ERROR: AS608 not detected!");
+    Serial.println("Check:");
+    Serial.println("- VCC");
+    Serial.println("- GND");
+    Serial.println("- TX/RX wiring");
+    Serial.println("- Baud rate");
+    lcdShowMessage("FINGER ERROR",
+                   "AS608 Missing",
+                   "Check Wiring",
+                   "See Serial");
+    return false;
+  }
+
+  fingerprintReady = true;
+  fingerprintWorkingBaud = FINGERPRINT_PRIMARY_BAUD;
+  Serial.println("SUCCESS: AS608 detected!");
+  printFingerprintParameters();
+  lcdShowMessage("FINGERPRINT OK",
+                 "AS608 Detected",
+                 "Baud: 57600",
+                 "Ready");
+  Serial.println();
+  return true;
+}
+
+bool setupFingerprintWithBaudScan() {
   lcdShowMessage("FINGER TEST",
                  "Working Test Setup",
                  "UART2 GPIO 16/17",
                  "Baud: 57600");
 
-  Serial.println();
-  Serial.println("=== AS608 Fingerprint Test ===");
-  Serial.println("Using working Fingerprint.ino pattern");
-  Serial.println("UART: HardwareSerial(2)");
-  Serial.print("RX: GPIO");
-  Serial.println(FINGER_RX_PIN);
-  Serial.print("TX: GPIO");
-  Serial.println(FINGER_TX_PIN);
-  Serial.println("Format: SERIAL_8N1");
-  Serial.print("Baud: ");
-  Serial.println(FINGERPRINT_PRIMARY_BAUD);
-  Serial.println();
-
-  Serial.println("Trying AS608 at 57600...");
-  if (initializeFingerprintAtBaud(FINGERPRINT_PRIMARY_BAUD)) {
-    Serial.println("[FINGERPRINT] SUCCESS: AS608 detected at 57600");
-    printFingerprintParameters();
-    lcdShowMessage("FINGERPRINT OK",
-                   "AS608 Detected",
-                   "Baud: 57600",
-                   "Ready");
-    Serial.println();
+  if (runFingerprintStandaloneStyleTest()) {
     return true;
   }
 
@@ -2335,8 +2696,8 @@ bool setupFingerprintWithBaudScan() {
 }
 
 bool initializeFingerprintAtBaud(uint32_t baudRate) {
-  // Match the known-working Fingerprint.ino begin order exactly. This helper is
-  // called only at startup or by command F, never repeatedly from loop().
+  // Optional recovery helper for startup fallback rates. Command F uses only
+  // runFingerprintStandaloneStyleTest() and the exact working 57600 pattern.
   fingerprintSerial.begin(baudRate, SERIAL_8N1, FINGER_RX_PIN, FINGER_TX_PIN);
   delay(100);
 
@@ -2746,11 +3107,11 @@ void processSerialInput(String input) {
       break;
 
     case 'F':
-      setupFingerprintWithBaudScan();
+      runStateGuardedDiagnostic('F');
       break;
 
     case 'P':
-      testSimpleFingerprintScan();
+      runStateGuardedDiagnostic('P');
       break;
 
     case 'V':
@@ -2809,11 +3170,15 @@ void processSerialInput(String input) {
       break;
 
     case 'D':
-      testDoor();
+      runStateGuardedDiagnostic('D');
       break;
 
     case 'U':
-      printUltrasonicStatus();
+      runStateGuardedDiagnostic('U');
+      break;
+
+    case 'W':
+      runStateGuardedDiagnostic('W');
       break;
 
     default:
@@ -2917,6 +3282,22 @@ void markUserOutsideArea(User* user, Area area) {
   if (user != nullptr && areaBit != 0) {
     user->insideMask &= ~static_cast<uint16_t>(areaBit);
   }
+}
+
+bool commitAttendanceAfterDoorOpen(User* user,
+                                   Area area,
+                                   AccessMode accessMode,
+                                   bool isDoorOpen) {
+  if (!isDoorOpen || user == nullptr || getAreaBit(area) == 0) {
+    return false;
+  }
+
+  if (accessMode == MODE_EXIT) {
+    markUserOutsideArea(user, area);
+  } else {
+    markUserInsideArea(user, area);
+  }
+  return true;
 }
 
 bool canUserEnterArea(User* user, Area area) {
@@ -3055,10 +3436,12 @@ void grantAccess(User* user, Area area, String method) {
     return;
   }
 
-  if (grantedMode == MODE_EXIT) {
-    markUserOutsideArea(user, area);
-  } else {
-    markUserInsideArea(user, area);
+  if (!commitAttendanceAfterDoorOpen(user, area, grantedMode, doorOpen)) {
+    Serial.println("[ACCESS STATE ERROR]");
+    Serial.println("Door is open, but attendance could not be committed.");
+    Serial.println("Failed-attempt counter is unchanged.");
+    returnToEntryMode();
+    return;
   }
   resetFailedAttempts();
 

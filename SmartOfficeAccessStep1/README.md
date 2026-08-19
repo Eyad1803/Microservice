@@ -4,6 +4,38 @@ This Arduino project continues the Task 6 hardware and security system, adds Com
 
 Task 7 is a software-only update. It does not add Wi-Fi, an app, database, real push buttons, parking logic, a relay, multiple servos, sensors, or persistent storage. All users start outside after an ESP32 reset.
 
+## Standalone project components
+
+- ESP32 development board
+- AS608 UART fingerprint sensor
+- RC522 RFID reader used only for the Admin Master Card
+- 20x4 I2C LCD
+- SG90-compatible servo door actuator
+- HC-SR04 ultrasonic presence sensor
+- Red LED, green LED, and active buzzer
+- External regulated 5 V supply and required voltage-level protection
+
+## Implemented Tasks 1–7
+
+- **Task 1:** Serial area selection, fingerprint recognition/enrollment, local users and permissions, and Admin RFID.
+- **Task 2:** Four-line 20x4 LCD status and error messages with trimmed rows and duplicate-screen suppression.
+- **Task 3:** Red LED and active-buzzer feedback for denials and errors.
+- **Task 4:** Green LED feedback for granted entry, granted exit, and recognized Admin RFID.
+- **Task 5:** Three-attempt Lockdown Mode, Admin unlock, 60-second Admin Mode, and protected enrollment.
+- **Task 6:** GPIO13 servo door plus GPIO33/34 ultrasonic presence and safe automatic closing.
+- **Task 7:** Company C/D, users 5/6, per-user/per-area anti-passback, attendance masks, and occupancy counts.
+
+## Project Logic Contract
+
+- Fingerprint identifies the user but does not open the door directly; permissions and anti-passback decide access.
+- The servo opens only after Access Granted or Exit Granted. Command `D` is the isolated movement-test exception.
+- Ultrasonic detects presence only and never opens the door.
+- RFID is Admin-only and never opens the door directly.
+- Attendance changes only after the door software state becomes `OPEN`.
+- Diagnostic commands do not change attendance or security state.
+- Enrollment is allowed only while Admin Mode is active.
+- Lockdown is cleared only by the configured Admin RFID card.
+
 ## Power safety — read before connecting USB
 
 The proposed power plan is safe **only with the protections below in place**. Do not power the complete assembled circuit until the LCD I2C voltage, AS608 module voltage, HC-SR04 Echo divider, and external 5 V output have been checked with a multimeter.
@@ -138,7 +170,7 @@ finger.begin(57600);
 fingerprintReady = finger.verifyPassword();
 ```
 
-Startup and command `F` always try that exact 57600 method first and stop immediately if it succeeds. Only after it fails do they try 9600, 19200, and 38400 as recovery rates. The detected rate is stored in `fingerprintWorkingBaud`. UART2 is not restarted from the main loop.
+The internal `runFingerprintStandaloneStyleTest()` function and command `F` use that exact 57600 method and print the same detection result plus sensor parameters. They do not run access checks or change attendance/security state. Startup uses the same function first; only startup may try 9600, 19200, and 38400 afterward as recovery rates. The detected rate is stored in `fingerprintWorkingBaud`. UART2 is not restarted from the main loop.
 
 In full-system mode the AS608 is now the first peripheral initialized, before LCD, RFID, alerts, servo, and ultrasonic setup. This makes its startup order match isolation mode and removes earlier peripheral initialization as a possible software interference source. Physically connected modules still load the power rails even before their setup functions run, so full mode must also be tested with only the AS608 connected before reconnecting other hardware.
 
@@ -197,6 +229,15 @@ Only one isolation switch may be `1` at a time. Both isolation tests succeeded, 
 Servo-only mode initializes only Serial Monitor and the `ESP32Servo` object. It follows the working `servo_test.ino` pattern: a simple `attach()`, followed continuously by 0°, 90°, 180°, and 90° commands with one-second delays. RFID, fingerprint, LCD, ultrasonic, LEDs, buzzer, security, attendance, and door-control logic are not initialized or executed.
 
 The standalone file used GPIO 18, but the complete project already reserves GPIO 18 for the RC522 SPI clock. Sharing that line would corrupt both signals. The isolation test therefore uses the project's conflict-free servo pin GPIO 13. Move the servo signal wire to GPIO 13; do not change it to GPIO 18 in the complete system.
+
+Full-system servo setup also defaults to the working simple-attach pattern:
+
+```cpp
+#define SERVO_USE_SIMPLE_ATTACH 1
+doorServo.attach(SERVO_PIN);  // SERVO_PIN is GPIO 13
+```
+
+Setting the option to `0` keeps the advanced 50 Hz / 500–2400 µs attach path available, but simple attach is the tested default. Attachment success is checked with `doorServo.attached()` because ESP32Servo channel `0` is valid.
 
 For this test, connect only:
 
@@ -257,6 +298,7 @@ If the LCD is not detected, check its wiring and change `LCD_ADDRESS` to `0x3F`.
 | `X` | Enter one-attempt Exit Mode |
 | `D` | Test the servo door |
 | `U` | Take 10 ultrasonic readings, print timeouts and average distance |
+| `W` | Run a non-destructive hardware readiness check; the servo is not moved |
 
 Fingerprint reading happens only after `R`, so the idle loop does not flood the Serial Monitor.
 
@@ -305,10 +347,11 @@ The failed-attempt counter saturates at `3/3` while locked. Further access attem
 
 - Startup prints a hardware self-test summary for LCD, RFID, AS608, servo PWM, ultrasonic pins, and duplicate GPIO assignments.
 - Startup also prints a nonblocking `[POWER CHECK]` reminder before any hardware initialization.
-- `F` initializes UART2 GPIO 16/17 exactly like the working standalone test, calls `finger.begin(57600)`, verifies the password, and prints status, capacity, security level, packet length, and reported baud. Fallback rates are attempted only if 57600 fails. The optional touch wire is not a UART connection test.
+- `F` initializes UART2 GPIO 16/17 exactly like the working standalone test, calls `finger.begin(57600)`, verifies the password, and prints status, capacity, security level, packet length, and reported baud. It does not use fallback rates; optional fallback rates are startup recovery only. The optional touch wire is not a UART connection test.
 - `P` performs a simple 15-second fingerprint capture, conversion, and database search without checking permissions or opening the door.
 - `D` sends 0°, 90°, and 0° commands with visible delays. A three-wire servo has no feedback signal, so successful PWM attachment does not prove that the motor physically moved.
 - `U` takes ten measurements using a 30 ms Echo timeout, reports every timeout, and averages only valid readings.
+- `W` repeats the standalone-style fingerprint detection, takes ten ultrasonic readings, checks servo attachment without moving it, checks RFID/LCD status and GPIO conflicts, and prints `READY` or `NOT READY`. It snapshots and restores selected area, Entry/Exit mode, lockdown, Admin Mode, failed attempts, enrollment state, door software state, and every attendance mask.
 - GPIO 34 is input-only and is correctly used for HC-SR04 Echo. Echo must pass through a voltage divider because its raw output is normally 5 V.
 - The servo must use a stable external 5 V supply. Join the external supply GND to ESP32 GND, but do not blindly join external +5 V to an ESP32 that is already USB-powered.
 - The AS608 may draw approximately 120 mA, while a moving or stalled servo can draw much more. If fingerprint and servo failures occur together, measure the 5 V rail for voltage drop.
@@ -320,15 +363,15 @@ Missing hardware does not trap the program in setup: AS608 failure leaves other 
 
 Command `V` runs isolated mini tests without scanning RFID, capturing a fingerprint, reading the ultrasonic sensor, moving the servo, or activating LEDs and the buzzer. It validates:
 
-- all six user mappings and Company A/B/C/D, Server Room, Management/Admin, and Main Entrance permissions;
+- all six exact user permission profiles, including all restricted Company, Server Room, and Management/Admin combinations;
 - occupancy-bit independence, entry, duplicate-entry rejection, exit, already-outside rejection, and re-entry;
 - failure-counter thresholds and saturation, lockdown state, Admin unlock, counter reset, and Admin Mode timeout boundaries;
 - LCD 20x4 sizing, 20-character trimming, and duplicate-screen refresh suppression;
-- servo angles and the five-second/clear-area door-closing state rules;
+- attendance commit only after door state `OPEN`, servo angles, and the five-second/clear-area door-closing rules;
 - 20 cm presence calculations and the different Entry/Exit ultrasonic policies;
-- Serial command uniqueness, area mappings, and GPIO conflicts.
+- the fingerprint UART2/pin/57600 contract, simple servo attach default, servo GPIO13 versus RFID SCK GPIO18, Serial command uniqueness including `W`, area mappings, and GPIO conflicts.
 
-Before testing, the command snapshots attendance masks, lockdown, failed attempts, Admin Mode, mode selection, enrollment state, presence-prompt state, and cached LCD text. It restores that state before returning. A failed test prints its name, expected value, and actual value, followed by a complete summary.
+Before testing, the command snapshots attendance masks, selected area, Entry/Exit mode, lockdown, failed attempts, Admin Mode, enrollment state, door state/timer, ultrasonic cache, presence-prompt state, and cached LCD text/timestamp. It restores that state before returning. A failed test prints its name, expected value, and actual value, followed by a complete summary.
 
 Attendance is now committed only after an authorized servo-open command reaches the software `OPEN` state. If PWM attachment or door opening fails, occupancy and the failed-attempt counter remain unchanged.
 
@@ -399,6 +442,22 @@ The RFID admin identity is separate from fingerprint users. It enables Admin Mod
 
 > Configure and test `ADMIN_RFID_UID` before deliberately triggering Lockdown Mode. When the placeholder is still present, scanned UIDs are printed for configuration but no card can unlock the system.
 
+## Final staged hardware test order
+
+1. Upload code with only ESP32 connected.
+2. Open Serial Monitor at 115200.
+3. Run `V` and confirm all `PASS`.
+4. Connect only AS608 fingerprint sensor.
+5. Run `F`.
+6. If `F` succeeds, run `P`.
+7. Connect only servo signal/power safely.
+8. Run `D`.
+9. Connect ultrasonic with Echo voltage divider.
+10. Run `U`.
+11. Connect RFID and test Admin UID.
+12. Run `S` or `W` for readiness summary.
+13. Only then test full entry/exit flow.
+
 ## Suggested tests
 
 1. Send `V`; expect every mini test to report `PASS`, followed by `Result: OK` and confirmation that runtime state was restored.
@@ -416,3 +475,11 @@ The RFID admin identity is separate from fingerprint users. It enables Admin Mod
 13. Select area `6`, stand near, and use fingerprint ID 5; expect Employee C to enter Company C. Select area `7` with the same user for entry and expect a permission denial.
 14. Send `S`; verify all six users and occupancy counts for Main Entrance, Companies A-D, Server Room, and Management/Admin.
 15. Trigger lockdown and confirm both Entry and Exit Mode are blocked. Scan Admin RFID and confirm unlock feedback without servo movement.
+
+## Future work — FastAPI and SQLite
+
+FastAPI and SQLite integration are future work and are not part of the current standalone ESP32 verification.
+
+The current ESP32 sketch intentionally contains no Wi-Fi connection, `HTTPClient`, HTTP requests, backend log upload, database synchronization, mobile-app communication, or cloud logic. Any backend and application folders in the wider workspace are separate software components; the ESP32-to-backend communication path has not yet been implemented or tested.
+
+The future integration phase may add ESP32 Wi-Fi/HTTP communication and synchronization with the existing API/database. Until that phase is implemented and tested, local hardcoded permissions, attendance, anti-passback, Admin Mode, and Lockdown remain authoritative inside the standalone ESP32 controller.
