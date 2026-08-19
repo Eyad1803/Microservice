@@ -9,6 +9,10 @@
 // keeps GPIO13 because GPIO18 is already the RC522 SCK pin in the full project.
 #define SERVO_ONLY_DEBUG 0
 
+#define FINGERPRINT_MODEL "AS608/JM-101B"
+#define FINGERPRINT_EXPECTED_VOLTAGE "3.3V"
+#define FINGERPRINT_EXPECTED_CURRENT_MA 60
+
 #if FINGERPRINT_ONLY_DEBUG
 
 // Exact copy of the known-working standalone Fingerprint.ino. The complete
@@ -25,18 +29,20 @@ void setup() {
   delay(1000);
 
   Serial.println();
-  Serial.println("=== AS608 Fingerprint Test ===");
+  Serial.println("=== AS608 / JM-101B Fingerprint Test ===");
+  Serial.println("Interface: UART only (USB D+/D- not used)");
+  Serial.println("Expected voltage: 3.3V");
 
   fingerprintSerial.begin(57600, SERIAL_8N1, RX_PIN, TX_PIN);
 
-  Serial.println("Checking fingerprint sensor...");
+  Serial.println("Checking sensor...");
 
   finger.begin(57600);
 
   if (finger.verifyPassword()) {
-    Serial.println("SUCCESS: AS608 detected!");
+    Serial.println("SUCCESS: AS608 / JM-101B detected!");
   } else {
-    Serial.println("ERROR: AS608 not detected!");
+    Serial.println("ERROR: AS608 / JM-101B not detected!");
     Serial.println("Check:");
     Serial.println("- VCC");
     Serial.println("- GND");
@@ -115,7 +121,7 @@ void loop() {
   - Use a regulated external 5V supply for the servo and join its GND to
     ESP32 GND. While USB is connected, do not join external +5V to the
     ESP32 5V/VIN pin unless the exact board schematic confirms safe isolation.
-  - A missing common ground or a weak 5V rail can cause fingerprint failures,
+  - A missing common ground or unstable 3.3V/5V rails can cause fingerprint failures,
     servo jitter, LCD flicker, unstable readings, and ESP32 brownout resets.
 */
 
@@ -160,10 +166,16 @@ constexpr uint8_t LCD_SCL_PIN = 22;
   the exact LCD/backpack is confirmed to operate correctly at that voltage.
 */
 
-// Fingerprint sensor pins (ESP32 UART2)
-// Sensor TX connects to ESP32 RX; sensor RX connects to ESP32 TX.
-// AS608 supply and UART voltage levels vary by module. Follow its label/data
-// sheet. If powered at 5V, verify TX is 3.3V-safe before connecting GPIO16.
+/*
+  Fingerprint sensor used in this project:
+  - AS608 / JM-101B optical fingerprint sensor
+  - Product specification operating voltage: 3.3V
+  - Typical current: about 60mA
+  - Interface used: UART only; USB D+ and D- are not used
+  - Use PCB/datasheet labels, not wire colors
+  - Sensor UART TX -> ESP32 GPIO16 / RX2
+  - Sensor UART RX -> ESP32 GPIO17 / TX2
+*/
 #define FINGER_RX_PIN 16
 #define FINGER_TX_PIN 17
 
@@ -231,6 +243,12 @@ struct AccessControlStateSnapshot {
   bool waitingForEnrollmentID;
   bool doorOpen;
   unsigned long doorOpenedAt;
+  bool presencePromptVisible;
+  unsigned long lastLCDMessageAt;
+  String lcdLine1;
+  String lcdLine2;
+  String lcdLine3;
+  String lcdLine4;
   uint16_t insideMasks[USER_COUNT];
 };
 
@@ -294,7 +312,9 @@ void runHardwareReadinessCheck();
 AccessControlStateSnapshot captureAccessControlState();
 bool isAccessControlStateUnchanged(
     const AccessControlStateSnapshot& snapshot);
+bool isLCDCacheUnchanged(const AccessControlStateSnapshot& snapshot);
 void restoreAccessControlState(const AccessControlStateSnapshot& snapshot);
+void restoreDiagnosticLCD(const AccessControlStateSnapshot& snapshot);
 bool isStateGuardedDiagnosticCommand(char command);
 void runStateGuardedDiagnostic(char command);
 bool validatePinAssignments();
@@ -464,9 +484,9 @@ void setup() {
   Serial.println("RFID must be 3.3V only.");
   Serial.println("Servo should use external regulated 5V.");
   Serial.println("HC-SR04 Echo must use a voltage divider.");
-  Serial.println("Check LCD I2C and AS608 TX logic levels before connection.");
+  Serial.println("JM-101B: use 3.3V and UART TX/RX only; never connect USB D+/D- to GPIO16/17.");
   Serial.println("All GND must be common.");
-  Serial.println("If F/U/D fail together, check 5V power and common GND first.");
+  Serial.println("If F/U/D fail together, check 3.3V, servo 5V, and common GND first.");
   Serial.println();
 
   // Initialize the proven AS608 UART path before any other peripheral library.
@@ -534,14 +554,16 @@ void setupFingerprintOnlyDebug() {
   Serial.println(FINGER_TX_PIN);
   Serial.println("Baud 57600");
   Serial.println();
-  Serial.println("=== AS608 Fingerprint Isolation Test ===");
+  Serial.println("=== AS608 / JM-101B Fingerprint Isolation Test ===");
+  Serial.println("Expected voltage: 3.3V");
+  Serial.println("Interface: UART TX/RX only; USB D+/D- are unused.");
 
   // Preserve the known-working standalone Fingerprint.ino initialization
   // order exactly: explicit UART2 pins, finger.begin(), then password check.
   fingerprintSerial.begin(57600, SERIAL_8N1, FINGER_RX_PIN, FINGER_TX_PIN);
   delay(100);
 
-  Serial.println("Checking fingerprint sensor...");
+  Serial.println("Checking sensor...");
 
   finger.begin(57600);
   delay(100);
@@ -549,19 +571,19 @@ void setupFingerprintOnlyDebug() {
   fingerprintReady = finger.verifyPassword();
   if (!fingerprintReady) {
     fingerprintWorkingBaud = 0;
-    Serial.println("ERROR: AS608 not detected even in isolation mode.");
+    Serial.println("ERROR: AS608 / JM-101B not detected even in isolation mode.");
     Serial.println("This means the problem is not caused by the full project logic.");
     Serial.println("Check current board, power, wiring, TX/RX, or GPIO16/GPIO17 availability.");
     Serial.println("Check:");
-    Serial.println("- VCC");
+    Serial.println("- VCC must be 3.3V for this JM-101B");
     Serial.println("- GND");
-    Serial.println("- TX/RX wiring");
+    Serial.println("- UART TX/RX wiring (not USB D+/D-)");
     Serial.println("- Baud rate");
     return;
   }
 
   fingerprintWorkingBaud = 57600;
-  Serial.println("SUCCESS: AS608 detected!");
+  Serial.println("SUCCESS: AS608 / JM-101B detected!");
   Serial.println();
   Serial.println("Sensor information:");
 
@@ -1012,10 +1034,10 @@ void setupDoorServo() {
   /*
    * IMPORTANT POWER NOTE:
    * If the fingerprint sensor worked before connecting the servo but stopped
-   * afterward, the shared 5 V supply is probably dropping under servo load.
-   * Do not power the servo from ESP32 3.3 V. Prefer a stable external 5 V
-   * servo supply, connect its GND to ESP32 GND, and measure the voltage.
-   * The AS608 may draw about 120 mA and a moving servo can draw much more.
+   * afterward, check common-ground noise and both the 3.3 V sensor rail and
+   * external 5 V servo rail. Do not power the servo from ESP32 3.3 V.
+   * This JM-101B is specified for 3.3 V at about 60 mA; the moving servo can
+   * draw much more from its separate regulated 5 V supply.
    */
   int servoPwmChannel = -1;
 #if SERVO_USE_SIMPLE_ATTACH
@@ -1588,7 +1610,7 @@ void printMenu() {
   Serial.println("7 = Company D");
   Serial.println("E = Enroll fingerprint (Admin Mode only)");
   Serial.println("R = Read/test fingerprint");
-  Serial.println("F = Detect AS608 using working Fingerprint.ino method");
+  Serial.println("F = Detect AS608/JM-101B at 3.3V using UART2");
   Serial.println("P = Simple fingerprint scan/match test");
   Serial.println("V = Run full software validation tests");
   Serial.println("M = Print menu");
@@ -1653,6 +1675,10 @@ void printHardwareSelfTest() {
   Serial.println(rfidInitialized ? "Initialized" : "Not Initialized");
   Serial.print("Fingerprint: ");
   Serial.println(fingerprintReady ? "Detected" : "Not Detected");
+  Serial.print("Fingerprint Model: ");
+  Serial.println(FINGERPRINT_MODEL);
+  Serial.print("Fingerprint Expected Voltage: ");
+  Serial.println(FINGERPRINT_EXPECTED_VOLTAGE);
   Serial.print("Fingerprint Baud: ");
   if (fingerprintWorkingBaud > 0) {
     Serial.println(fingerprintWorkingBaud);
@@ -1675,7 +1701,7 @@ void printHardwareSelfTest() {
   Serial.println(" (input-only pin: correct)");
   Serial.print("Pin Conflict Check: ");
   Serial.println(validatePinAssignments() ? "PASS" : "FAIL");
-  Serial.println("Power Note: If servo and fingerprint fail together, check stable 5 V power and common GND.");
+  Serial.println("Power Note: JM-101B uses 3.3V; servo uses separate 5V; common GND is required.");
   Serial.println("====================================================");
   Serial.println();
 
@@ -1696,6 +1722,12 @@ AccessControlStateSnapshot captureAccessControlState() {
   snapshot.waitingForEnrollmentID = waitingForEnrollmentID;
   snapshot.doorOpen = doorOpen;
   snapshot.doorOpenedAt = doorOpenedAt;
+  snapshot.presencePromptVisible = presencePromptVisible;
+  snapshot.lastLCDMessageAt = lastLCDMessageAt;
+  snapshot.lcdLine1 = lastLcdLine1;
+  snapshot.lcdLine2 = lastLcdLine2;
+  snapshot.lcdLine3 = lastLcdLine3;
+  snapshot.lcdLine4 = lastLcdLine4;
   for (size_t i = 0; i < USER_COUNT; ++i) {
     snapshot.insideMasks[i] = users[i].insideMask;
   }
@@ -1712,11 +1744,20 @@ bool isAccessControlStateUnchanged(
                    adminModeStartTime == snapshot.adminModeStartTime &&
                    waitingForEnrollmentID == snapshot.waitingForEnrollmentID &&
                    doorOpen == snapshot.doorOpen &&
-                   doorOpenedAt == snapshot.doorOpenedAt;
+                   doorOpenedAt == snapshot.doorOpenedAt &&
+                   presencePromptVisible == snapshot.presencePromptVisible;
   for (size_t i = 0; i < USER_COUNT; ++i) {
     unchanged &= users[i].insideMask == snapshot.insideMasks[i];
   }
   return unchanged;
+}
+
+bool isLCDCacheUnchanged(const AccessControlStateSnapshot& snapshot) {
+  return lastLCDMessageAt == snapshot.lastLCDMessageAt &&
+         lastLcdLine1 == snapshot.lcdLine1 &&
+         lastLcdLine2 == snapshot.lcdLine2 &&
+         lastLcdLine3 == snapshot.lcdLine3 &&
+         lastLcdLine4 == snapshot.lcdLine4;
 }
 
 void restoreAccessControlState(const AccessControlStateSnapshot& snapshot) {
@@ -1729,8 +1770,25 @@ void restoreAccessControlState(const AccessControlStateSnapshot& snapshot) {
   waitingForEnrollmentID = snapshot.waitingForEnrollmentID;
   doorOpen = snapshot.doorOpen;
   doorOpenedAt = snapshot.doorOpenedAt;
+  presencePromptVisible = snapshot.presencePromptVisible;
+  lastLCDMessageAt = snapshot.lastLCDMessageAt;
+  lastLcdLine1 = snapshot.lcdLine1;
+  lastLcdLine2 = snapshot.lcdLine2;
+  lastLcdLine3 = snapshot.lcdLine3;
+  lastLcdLine4 = snapshot.lcdLine4;
   for (size_t i = 0; i < USER_COUNT; ++i) {
     users[i].insideMask = snapshot.insideMasks[i];
+  }
+}
+
+void restoreDiagnosticLCD(const AccessControlStateSnapshot& snapshot) {
+  if (lcdInitialized && !isLCDCacheUnchanged(snapshot)) {
+    // Redraw the pre-diagnostic screen while the diagnostic cache is still
+    // active. restoreAccessControlState() then restores the original timestamp.
+    lcdShowMessage(snapshot.lcdLine1,
+                   snapshot.lcdLine2,
+                   snapshot.lcdLine3,
+                   snapshot.lcdLine4);
   }
 }
 
@@ -1745,6 +1803,14 @@ void runHardwareReadinessCheck() {
   Serial.println();
   Serial.println("[HARDWARE READINESS CHECK]");
   Serial.println("This check does not move the servo or make access decisions.");
+  Serial.print("Fingerprint Sensor: ");
+  Serial.println(FINGERPRINT_MODEL);
+  Serial.print("Expected voltage: ");
+  Serial.println(FINGERPRINT_EXPECTED_VOLTAGE);
+  Serial.println("UART: GPIO16 RX, GPIO17 TX");
+  Serial.print("Baud: ");
+  Serial.println(FINGERPRINT_PRIMARY_BAUD);
+  Serial.println("USB D+/D-: not used");
   Serial.println();
 
   bool fingerprintOK = runFingerprintStandaloneStyleTest();
@@ -1781,7 +1847,7 @@ void runHardwareReadinessCheck() {
   Serial.println(gpioOK ? "none" : "FOUND");
   Serial.print("Access/security state unchanged: ");
   Serial.println(accessStateUnchanged ? "YES" : "NO - state restored");
-  Serial.println("Power warning: verify regulated 5V, safe logic levels, and common GND.");
+  Serial.println("Power warning: JM-101B 3.3V, servo regulated 5V, and common GND.");
   Serial.print("Result: ");
   Serial.println(ready ? "READY" : "NOT READY");
   Serial.println();
@@ -1816,11 +1882,17 @@ void runStateGuardedDiagnostic(char command) {
       break;
   }
 
-  if (!isAccessControlStateUnchanged(savedState)) {
-    restoreAccessControlState(savedState);
+  bool accessStateUnchanged = isAccessControlStateUnchanged(savedState);
+  bool lcdCacheUnchanged = isLCDCacheUnchanged(savedState);
+  restoreDiagnosticLCD(savedState);
+  restoreAccessControlState(savedState);
+
+  if (!accessStateUnchanged) {
     Serial.println("[DIAGNOSTIC STATE GUARD]");
     Serial.println("ERROR: Diagnostic attempted to change access-control state.");
     Serial.println("Original attendance and security state restored.");
+  } else if (!lcdCacheUnchanged) {
+    Serial.println("[DIAGNOSTIC STATE GUARD] Original LCD screen restored.");
   }
 }
 
@@ -2354,6 +2426,17 @@ void runSoftwareValidation() {
            isAccessControlStateUnchanged(diagnosticState),
            "attendance restored",
            "attendance mismatch");
+  lastLcdLine1 = "DIAGNOSTIC SCREEN";
+  ++lastLCDMessageAt;
+  validate("Diagnostic state guard detects LCD cache changes",
+           !isLCDCacheUnchanged(diagnosticState),
+           "change detected",
+           "change missed");
+  restoreAccessControlState(diagnosticState);
+  validate("Diagnostic state guard restores LCD cached state",
+           isLCDCacheUnchanged(diagnosticState),
+           "LCD cache restored",
+           "LCD cache mismatch");
   validate("Ultrasonic pulse timeout is finite",
            ULTRASONIC_ECHO_TIMEOUT_US == 30000,
            "30000 us",
@@ -2364,6 +2447,12 @@ void runSoftwareValidation() {
                FINGERPRINT_PRIMARY_BAUD == 57600,
            "RX16/TX17/57600",
            "fingerprint transport mismatch");
+  validate("Fingerprint profile is AS608/JM-101B at 3.3V",
+           String(FINGERPRINT_MODEL) == "AS608/JM-101B" &&
+               String(FINGERPRINT_EXPECTED_VOLTAGE) == "3.3V" &&
+               FINGERPRINT_EXPECTED_CURRENT_MA == 60,
+           "AS608/JM-101B, 3.3V, about 60mA",
+           "sensor profile mismatch");
   validate("Servo uses project GPIO13 instead of RFID SCK GPIO18",
            SERVO_PIN == 13 && RFID_SCK_PIN == 18 &&
                SERVO_PIN != RFID_SCK_PIN,
@@ -2494,6 +2583,10 @@ void printSystemStatus() {
   Serial.println(rfidInitialized ? "YES" : "NO");
   Serial.print("Fingerprint Detected: ");
   Serial.println(fingerprintReady ? "YES" : "NO");
+  Serial.print("Fingerprint Model / Voltage: ");
+  Serial.print(FINGERPRINT_MODEL);
+  Serial.print(" / ");
+  Serial.println(FINGERPRINT_EXPECTED_VOLTAGE);
   Serial.print("Fingerprint Baud: ");
   if (fingerprintWorkingBaud > 0) {
     Serial.println(fingerprintWorkingBaud);
@@ -2508,7 +2601,7 @@ void printSystemStatus() {
   Serial.println(BUZZER_PIN);
   Serial.print("Green LED Pin: GPIO ");
   Serial.println(GREEN_LED_PIN);
-  Serial.println("Power Note: If servo and fingerprint fail together, check stable 5 V power and common GND.");
+  Serial.println("Power Note: JM-101B uses 3.3V UART; servo uses separate 5V; common GND required.");
   Serial.print("Admin RFID UID: ");
   Serial.println(ADMIN_RFID_UID);
   Serial.println("Users configured:");
@@ -2600,14 +2693,17 @@ bool runFingerprintStandaloneStyleTest() {
   fingerprintWorkingBaud = 0;
 
   Serial.println();
-  Serial.println("=== AS608 Fingerprint Test ===");
-  Serial.println("Using HardwareSerial(2)");
+  Serial.println("=== AS608 / JM-101B Fingerprint Test ===");
+  Serial.println("UART: HardwareSerial(2)");
   Serial.print("RX: GPIO");
   Serial.println(FINGER_RX_PIN);
   Serial.print("TX: GPIO");
   Serial.println(FINGER_TX_PIN);
   Serial.print("Baud: ");
   Serial.println(FINGERPRINT_PRIMARY_BAUD);
+  Serial.print("Voltage expected: ");
+  Serial.println(FINGERPRINT_EXPECTED_VOLTAGE);
+  Serial.println("USB D+/D-: not used");
 
   // Exact low-level order from the working Fingerprint.ino test:
   // UART2 begin -> finger.begin(57600) -> verifyPassword().
@@ -2615,15 +2711,15 @@ bool runFingerprintStandaloneStyleTest() {
                           SERIAL_8N1,
                           FINGER_RX_PIN,
                           FINGER_TX_PIN);
-  Serial.println("Checking fingerprint sensor...");
+  Serial.println("Checking sensor...");
   finger.begin(FINGERPRINT_PRIMARY_BAUD);
 
   if (!finger.verifyPassword()) {
-    Serial.println("ERROR: AS608 not detected!");
+    Serial.println("ERROR: AS608 / JM-101B not detected!");
     Serial.println("Check:");
-    Serial.println("- VCC");
+    Serial.println("- VCC must be 3.3V for this JM-101B");
     Serial.println("- GND");
-    Serial.println("- TX/RX wiring");
+    Serial.println("- UART TX/RX wiring (not USB D+/D-)");
     Serial.println("- Baud rate");
     lcdShowMessage("FINGER ERROR",
                    "AS608 Missing",
@@ -2634,7 +2730,7 @@ bool runFingerprintStandaloneStyleTest() {
 
   fingerprintReady = true;
   fingerprintWorkingBaud = FINGERPRINT_PRIMARY_BAUD;
-  Serial.println("SUCCESS: AS608 detected!");
+  Serial.println("SUCCESS: AS608 / JM-101B detected!");
   printFingerprintParameters();
   lcdShowMessage("FINGERPRINT OK",
                  "AS608 Detected",
@@ -2654,7 +2750,7 @@ bool setupFingerprintWithBaudScan() {
     return true;
   }
 
-  Serial.println("[FINGERPRINT] ERROR: AS608 not detected using the working-test initialization pattern");
+  Serial.println("[FINGERPRINT] ERROR: AS608 / JM-101B not detected using the working-test initialization pattern");
   Serial.println("Primary 57600 test failed; trying optional fallback rates.");
 
   constexpr size_t fallbackCount =
@@ -2680,12 +2776,13 @@ bool setupFingerprintWithBaudScan() {
   }
 
   Serial.println("[FINGERPRINT ERROR]");
-  Serial.println("ERROR: AS608 not detected!");
+  Serial.println("ERROR: AS608 / JM-101B not detected!");
   Serial.println("Check:");
-  Serial.println("- VCC and supported module voltage");
+  Serial.println("- JM-101B VCC connected to 3.3V");
   Serial.println("- Common GND");
-  Serial.println("- Sensor TX -> ESP32 RX2 GPIO16");
-  Serial.println("- Sensor RX -> ESP32 TX2 GPIO17");
+  Serial.println("- UART TX -> ESP32 RX2 GPIO16");
+  Serial.println("- UART RX -> ESP32 TX2 GPIO17");
+  Serial.println("- USB D+/D- left disconnected");
   Serial.println("- Baud rate and default password");
   Serial.println();
   lcdShowMessage("FINGER ERROR",
@@ -2741,7 +2838,7 @@ void printFingerprintParameters() {
 
 void testSimpleFingerprintScan() {
   Serial.println();
-  Serial.println("=== AS608 Simple Scan Test ===");
+  Serial.println("=== AS608 / JM-101B Simple Scan Test ===");
 
   if (!fingerprintReady) {
     Serial.println("ERROR: AS608 is not initialized.");

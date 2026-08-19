@@ -7,7 +7,7 @@ Task 7 is a software-only update. It does not add Wi-Fi, an app, database, real 
 ## Standalone project components
 
 - ESP32 development board
-- AS608 UART fingerprint sensor
+- AS608 / JM-101B 3.3 V UART fingerprint sensor (about 60 mA)
 - RC522 RFID reader used only for the Admin Master Card
 - 20x4 I2C LCD
 - SG90-compatible servo door actuator
@@ -38,13 +38,14 @@ Task 7 is a software-only update. It does not add Wi-Fi, an app, database, real 
 
 ## Power safety — read before connecting USB
 
-The proposed power plan is safe **only with the protections below in place**. Do not power the complete assembled circuit until the LCD I2C voltage, AS608 module voltage, HC-SR04 Echo divider, and external 5 V output have been checked with a multimeter.
+The proposed power plan is safe **only with the protections below in place**. Do not power the complete assembled circuit until the LCD I2C voltage, JM-101B 3.3 V supply, HC-SR04 Echo divider, and external 5 V output have been checked with a multimeter.
 
 Recommended development power arrangement:
 
 - Power the ESP32 from the computer USB connector.
 - Power the RC522 only from the ESP32 `3V3` pin.
-- Use a regulated external 5 V rail for the servo and, when their exact modules support 5 V, the AS608, LCD, and HC-SR04.
+- Power this project's AS608 / JM-101B from ESP32 `3V3`, as specified for the selected module.
+- Use a regulated external 5 V rail for the servo and, with the required level protection, the LCD and HC-SR04.
 - Connect the external supply GND directly to ESP32 GND so every signal has the same reference.
 - While USB is connected, **do not connect the external supply +5 V to the ESP32 `5V`/`VIN` pin** unless the exact DevKit schematic confirms that its USB and VIN paths are safely isolated. Clone boards differ, and joining two 5 V sources can back-feed a computer USB port or a regulator.
 - Never connect external 5 V to `3V3`, and never allow a powered 5 V peripheral output to drive an unpowered ESP32 GPIO.
@@ -67,16 +68,20 @@ Use a star-like ground arrangement: return the servo's VCC/GND current directly 
 
 > Power the RC522 from **3.3 V only**.
 
-### AS608 fingerprint sensor to ESP32 UART2
+### AS608 / JM-101B fingerprint sensor to ESP32 UART2
 
-| Fingerprint sensor | ESP32 |
+| JM-101B signal | ESP32 |
 | --- | --- |
-| VCC | External regulated 5 V **only if this exact module supports 5 V**; otherwise use its specified voltage |
+| VCC | `3V3` — this selected JM-101B is specified for 3.3 V |
 | GND | Common GND |
-| TX | GPIO 16 / RX2 |
-| RX | GPIO 17 / TX2 |
+| UART TX | GPIO 16 / RX2 |
+| UART RX | GPIO 17 / TX2 |
+| USB D+ | Not connected |
+| USB D- | Not connected |
 
-Sensor TX connects to ESP32 RX, and sensor RX connects to ESP32 TX. AS608-branded modules are sold with different supply ranges, so check the label or datasheet for the exact board; do not infer its voltage from the name alone. If powered from 5 V, measure the sensor TX idle voltage before connecting GPIO 16. It must be 3.3 V-safe; otherwise use a suitable UART level shifter (or a divider on sensor TX). The UART uses 8 data bits, no parity, and 1 stop bit. `TOUCH`, `WAKE`, or illumination-control wires are not required for UART connection detection; leave extra wires disconnected unless the exact module pinout says otherwise.
+The selected sensor is the AS608 / JM-101B profile documented by the product specification as 3.3 V, about 60 mA, 500 dpi, with USB and UART interfaces. This project uses **UART only**. Sensor UART TX connects to ESP32 RX, and sensor UART RX connects to ESP32 TX. If the connector exposes USB `D+` or `D-`, leave them disconnected; they are not UART signals and must never be connected to GPIO16/GPIO17. Use the labels on the sensor PCB or its exact datasheet and do not trust wire colors blindly, because sellers may use different wire colors. The UART uses 8 data bits, no parity, and 1 stop bit. `TOUCH`, `WAKE`, illumination, and other optional wires are not required for UART connection detection unless the exact JM-101B documentation explicitly assigns them.
+
+Do not connect this JM-101B to 5 V unless the exact physical board and its manufacturer documentation independently confirm 5 V tolerance. For the sensor selected in this project, the documented and recommended VCC is 3.3 V. Incorrect sensor power can prevent detection even when the UART code and wiring are correct.
 
 ### 20x4 I2C LCD to ESP32
 
@@ -140,11 +145,11 @@ Do not assume that a USB-C PD/QC output is 5 V. With the project disconnected, m
 
 ### Current load and brownout risk
 
-The servo is the dominant, rapidly changing load. An AS608 variant may also draw roughly 120 mA and peak near 150 mA, while the LCD backlight, HC-SR04, buzzer, and RC522 add more load. The exact total cannot be certified without the precise servo, LCD backpack, buzzer, and AS608 datasheets.
+The servo is the dominant, rapidly changing load. The selected JM-101B is specified at about 60 mA from 3.3 V, while the LCD backlight, HC-SR04, buzzer, and RC522 add more load. The exact total cannot be certified without the precise servo, LCD backpack, buzzer, and module datasheets.
 
 Do not use the ESP32 3.3 V regulator or its USB/VIN path as the complete project's power distribution rail. Servo start-up, reversal, or stall can pull the 5 V rail down and cause:
 
-- AS608 connection failures;
+- JM-101B UART connection failures caused by 3.3 V rail or common-ground disturbance;
 - ESP32 brownout resets;
 - servo jitter;
 - ultrasonic timeouts or unstable readings;
@@ -162,7 +167,7 @@ Select the external regulated 5 V supply from the servo's worst-case/stall curre
 
 ### Fingerprint integration note
 
-The AS608 integration now follows the known-working standalone `Fingerprint.ino` structure. It uses `HardwareSerial(2)`, GPIO 16 as RX, GPIO 17 as TX, `SERIAL_8N1`, and baud 57600. Initialization deliberately uses this order:
+The AS608 / JM-101B integration follows the known-working standalone `Fingerprint.ino` structure. It uses the sensor's UART interface, `HardwareSerial(2)`, GPIO 16 as RX, GPIO 17 as TX, `SERIAL_8N1`, and baud 57600. USB D+/D- are not used. Initialization deliberately uses this order:
 
 ```cpp
 fingerprintSerial.begin(57600, SERIAL_8N1, FINGER_RX_PIN, FINGER_TX_PIN);
@@ -172,7 +177,7 @@ fingerprintReady = finger.verifyPassword();
 
 The internal `runFingerprintStandaloneStyleTest()` function and command `F` use that exact 57600 method and print the same detection result plus sensor parameters. They do not run access checks or change attendance/security state. Startup uses the same function first; only startup may try 9600, 19200, and 38400 afterward as recovery rates. The detected rate is stored in `fingerprintWorkingBaud`. UART2 is not restarted from the main loop.
 
-In full-system mode the AS608 is now the first peripheral initialized, before LCD, RFID, alerts, servo, and ultrasonic setup. This makes its startup order match isolation mode and removes earlier peripheral initialization as a possible software interference source. Physically connected modules still load the power rails even before their setup functions run, so full mode must also be tested with only the AS608 connected before reconnecting other hardware.
+In full-system mode the JM-101B is the first peripheral initialized, before LCD, RFID, alerts, servo, and ultrasonic setup. This makes its startup order match isolation mode and removes earlier peripheral initialization as a possible software interference source. Physically connected modules still load the power rails even before their setup functions run, so full mode must also be tested with only the 3.3 V JM-101B connected before reconnecting other hardware.
 
 If the standalone `Fingerprint.ino` works but the main project does not, compare the `HardwareSerial` object, baud rate, begin order, RX/TX constants, and `verifyPassword()` result. Also verify that no other connected hardware is pulling down the sensor supply.
 
@@ -190,14 +195,15 @@ The sketch contains a permanent compile-time diagnostic switch near the top of `
 For the isolation test, leave the flag at `1` and connect only:
 
 - ESP32 to the computer by USB;
-- AS608 VCC to the voltage supported by the exact sensor module;
-- AS608 GND to ESP32 GND;
-- AS608 TX to ESP32 GPIO 16 / RX2;
-- AS608 RX to ESP32 GPIO 17 / TX2.
+- JM-101B VCC to ESP32 3.3 V;
+- JM-101B GND to ESP32 GND;
+- JM-101B UART TX to ESP32 GPIO 16 / RX2;
+- JM-101B UART RX to ESP32 GPIO 17 / TX2;
+- JM-101B USB D+ and D- left disconnected.
 
-Disconnect the RFID, LCD, servo, ultrasonic sensor, LEDs, buzzer, and external peripheral supply for this test. Open Serial Monitor at 115200 baud. The expected startup result is `SUCCESS: AS608 detected!`, followed by the sensor parameters and live fingerprint matching. If isolation succeeds but full mode fails, reconnect modules one at a time to identify power or initialization interference.
+Disconnect the RFID, LCD, servo, ultrasonic sensor, LEDs, buzzer, and external peripheral supply for this test. Open Serial Monitor at 115200 baud. The expected startup result is `SUCCESS: AS608 / JM-101B detected!`, followed by the sensor parameters and live fingerprint matching. If isolation succeeds but full mode fails, reconnect modules one at a time to identify power or initialization interference.
 
-If isolation reports `ERROR: AS608 not detected even in isolation mode`, the cause is outside the full application flow. Check the exact ESP32 board/module, supported AS608 supply and UART logic voltage, common ground, TX/RX crossover, cable continuity, and whether GPIO 16/17 are available.
+If isolation reports `ERROR: AS608 / JM-101B not detected even in isolation mode`, the cause is outside the full application flow. Check the 3.3 V supply, common ground, labeled UART TX/RX crossover, cable continuity, confirm that USB D+/D- were not mistaken for UART pins, and verify that GPIO 16/17 are available.
 
 #### ESP32 WROVER / PSRAM warning
 
@@ -288,7 +294,7 @@ If the LCD is not detected, check its wiring and change `LCD_ADDRESS` to `0x3F`.
 | `7` | Select Company D |
 | `E` | Enroll a fingerprint while Admin Mode is active |
 | `R` | Read a fingerprint and check permission |
-| `F` | Detect AS608 with the working `Fingerprint.ino` method and print sensor parameters |
+| `F` | Detect the 3.3 V AS608 / JM-101B over UART2 and print sensor parameters |
 | `P` | Simple timed fingerprint capture and database-match diagnostic |
 | `V` | Run full software validation mini tests without hardware I/O |
 | `M` | Print the command menu |
@@ -345,16 +351,17 @@ The failed-attempt counter saturates at `3/3` while locked. Further access attem
 
 ## Hardware diagnostics and power
 
-- Startup prints a hardware self-test summary for LCD, RFID, AS608, servo PWM, ultrasonic pins, and duplicate GPIO assignments.
+- Startup prints a hardware self-test summary for LCD, RFID, AS608/JM-101B, servo PWM, ultrasonic pins, and duplicate GPIO assignments.
 - Startup also prints a nonblocking `[POWER CHECK]` reminder before any hardware initialization.
-- `F` initializes UART2 GPIO 16/17 exactly like the working standalone test, calls `finger.begin(57600)`, verifies the password, and prints status, capacity, security level, packet length, and reported baud. It does not use fallback rates; optional fallback rates are startup recovery only. The optional touch wire is not a UART connection test.
+- `F` identifies the sensor as AS608/JM-101B, reports expected 3.3 V power and unused USB D+/D-, initializes UART2 GPIO 16/17 exactly like the working standalone test, calls `finger.begin(57600)`, verifies the password, and prints status, capacity, security level, packet length, and reported baud. It does not use fallback rates; optional fallback rates are startup recovery only.
 - `P` performs a simple 15-second fingerprint capture, conversion, and database search without checking permissions or opening the door.
 - `D` sends 0°, 90°, and 0° commands with visible delays. A three-wire servo has no feedback signal, so successful PWM attachment does not prove that the motor physically moved.
 - `U` takes ten measurements using a 30 ms Echo timeout, reports every timeout, and averages only valid readings.
-- `W` repeats the standalone-style fingerprint detection, takes ten ultrasonic readings, checks servo attachment without moving it, checks RFID/LCD status and GPIO conflicts, and prints `READY` or `NOT READY`. It snapshots and restores selected area, Entry/Exit mode, lockdown, Admin Mode, failed attempts, enrollment state, door software state, and every attendance mask.
+- `W` prints the exact AS608/JM-101B profile, 3.3 V expectation, UART GPIO16/17, 57600 baud, and unused USB D+/D-; it then repeats fingerprint detection, takes ten ultrasonic readings, checks servo attachment without moving it, checks RFID/LCD status and GPIO conflicts, and prints `READY` or `NOT READY`. It snapshots and restores selected area, Entry/Exit mode, lockdown, Admin Mode, failed attempts, enrollment state, door software state, presence-prompt state, every attendance mask, and the LCD cache.
+- Commands `F`, `P`, `D`, `U`, and `W` run through the diagnostic state guard. Their diagnostic LCD screens are temporary; after the command completes, the guard redraws the previous four-line LCD screen and restores its cached text/timestamp.
 - GPIO 34 is input-only and is correctly used for HC-SR04 Echo. Echo must pass through a voltage divider because its raw output is normally 5 V.
 - The servo must use a stable external 5 V supply. Join the external supply GND to ESP32 GND, but do not blindly join external +5 V to an ESP32 that is already USB-powered.
-- The AS608 may draw approximately 120 mA, while a moving or stalled servo can draw much more. If fingerprint and servo failures occur together, measure the 5 V rail for voltage drop.
+- The selected JM-101B is specified at about 60 mA from 3.3 V. If fingerprint failures appear when the externally powered servo moves, measure both the ESP32 3.3 V rail and servo 5 V rail and verify the common ground.
 - A USB-C PD/QC module must be measured and confirmed at 5 V before connection; an accidental 9 V, 12 V, or 20 V output can damage the project.
 
 Missing hardware does not trap the program in setup: AS608 failure leaves other functions available, the ultrasonic read has a finite timeout, LCD failure preserves Serial diagnostics, and servo diagnostics report only the commanded PWM because a three-wire servo has no position feedback. These protections prevent software hangs, but they cannot make incorrect voltage wiring safe.
@@ -369,7 +376,7 @@ Command `V` runs isolated mini tests without scanning RFID, capturing a fingerpr
 - LCD 20x4 sizing, 20-character trimming, and duplicate-screen refresh suppression;
 - attendance commit only after door state `OPEN`, servo angles, and the five-second/clear-area door-closing rules;
 - 20 cm presence calculations and the different Entry/Exit ultrasonic policies;
-- the fingerprint UART2/pin/57600 contract, simple servo attach default, servo GPIO13 versus RFID SCK GPIO18, Serial command uniqueness including `W`, area mappings, and GPIO conflicts.
+- the AS608/JM-101B model, 3.3 V/about-60 mA profile, fingerprint UART2/pin/57600 contract, simple servo attach default, servo GPIO13 versus RFID SCK GPIO18, Serial command uniqueness including `W`, area mappings, and GPIO conflicts.
 
 Before testing, the command snapshots attendance masks, selected area, Entry/Exit mode, lockdown, failed attempts, Admin Mode, enrollment state, door state/timer, ultrasonic cache, presence-prompt state, and cached LCD text/timestamp. It restores that state before returning. A failed test prints its name, expected value, and actual value, followed by a complete summary.
 
@@ -385,9 +392,10 @@ The normal access flow opens the servo only after granted entry or exit. Command
 - [ ] Servo uses a regulated external 5 V supply, never ESP32 `3V3` or the board's USB/VIN rail
 - [ ] Servo supply is rated for stall/start current plus the other loads and margin
 - [ ] Servo GND is connected directly to external supply GND, and that GND is joined to ESP32 GND
-- [ ] AS608 VCC range was checked on the exact module label/datasheet before selecting 3.3 V or 5 V
-- [ ] AS608 TX idle voltage was measured or level-shifted before connection to ESP32 GPIO 16
-- [ ] AS608 GND is connected to ESP32 GND; TX → GPIO 16 and RX → GPIO 17
+- [ ] The selected AS608 / JM-101B VCC is connected to ESP32 `3V3`, not 5 V
+- [ ] Sensor PCB/datasheet labels were followed instead of relying on wire colors
+- [ ] JM-101B GND is connected to ESP32 GND; UART TX → GPIO 16 and UART RX → GPIO 17
+- [ ] Any JM-101B USB D+ and D- pins are left disconnected from the ESP32
 - [ ] HC-SR04 is powered from 5 V
 - [ ] HC-SR04 ECHO → 1 kΩ → GPIO 34, with 2 kΩ from GPIO 34 → GND (or an equivalent 3.3 V-safe level shifter)
 - [ ] LCD is a 20x4 I2C display and SDA/SCL idle voltages were checked before connection
@@ -447,7 +455,7 @@ The RFID admin identity is separate from fingerprint users. It enables Admin Mod
 1. Upload code with only ESP32 connected.
 2. Open Serial Monitor at 115200.
 3. Run `V` and confirm all `PASS`.
-4. Connect only AS608 fingerprint sensor.
+4. Connect only the AS608 / JM-101B: VCC to 3.3 V, common GND, UART TX/RX crossed correctly, and USB D+/D- disconnected.
 5. Run `F`.
 6. If `F` succeeds, run `P`.
 7. Connect only servo signal/power safely.
@@ -461,7 +469,7 @@ The RFID admin identity is separate from fingerprint users. It enables Admin Mod
 ## Suggested tests
 
 1. Send `V`; expect every mini test to report `PASS`, followed by `Result: OK` and confirmation that runtime state was restored.
-2. Send `F`; expect the working-test initialization at 57600 to report `SUCCESS: AS608 detected`, followed by the sensor parameters.
+2. Send `F`; expect the UART2 initialization at 57600 to report `SUCCESS: AS608 / JM-101B detected!`, followed by the sensor parameters.
 3. Send `P`; place a finger within 15 seconds and verify capture, conversion, ID, and confidence output without access or door actions.
 4. Send `U`; verify ten readings, the valid-reading count, average distance, and `Person Near` result.
 5. Send `D`; verify the servo sequence 0° → 90° → 0°. If commands print but the motor does not move, check 5 V power and common GND. The command is blocked during lockdown.
