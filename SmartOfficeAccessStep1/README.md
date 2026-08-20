@@ -9,7 +9,7 @@ Task 7 is a software-only update. It does not add Wi-Fi, an app, database, real 
 - ESP32 development board
 - AS608 / JM-101B 3.3 V UART fingerprint sensor (about 60 mA)
 - RC522 RFID reader used only for the Admin Master Card
-- 20x4 I2C LCD
+- 16x2 I2C LCD
 - SG90-compatible servo door actuator
 - HC-SR04 ultrasonic presence sensor
 - Red LED, green LED, and active buzzer
@@ -18,11 +18,11 @@ Task 7 is a software-only update. It does not add Wi-Fi, an app, database, real 
 ## Implemented Tasks 1–7
 
 - **Task 1:** Serial area selection, fingerprint recognition/enrollment, local users and permissions, and Admin RFID.
-- **Task 2:** Four-line 20x4 LCD status and error messages with trimmed rows and duplicate-screen suppression.
+- **Task 2:** Two-line 16x2 LCD status and error messages with shortened rows and duplicate-screen suppression.
 - **Task 3:** Red LED and active-buzzer feedback for denials and errors.
 - **Task 4:** Green LED feedback for granted entry, granted exit, and recognized Admin RFID.
 - **Task 5:** Three-attempt Lockdown Mode, Admin unlock, 60-second Admin Mode, and protected enrollment.
-- **Task 6:** GPIO13 servo door plus GPIO33/34 ultrasonic presence and safe automatic closing.
+- **Task 6:** GPIO13 servo door plus GPIO21/22 ultrasonic presence and safe automatic closing.
 - **Task 7:** Company C/D, users 5/6, per-user/per-area anti-passback, attendance masks, and occupancy counts.
 
 ## Project Logic Contract
@@ -62,7 +62,7 @@ Use a star-like ground arrangement: return the servo's VCC/GND current directly 
 | SCK | GPIO 18 |
 | MOSI | GPIO 23 |
 | MISO | GPIO 19 |
-| RST | GPIO 27 |
+| RST | GPIO 33 |
 | 3.3V | 3V3 |
 | GND | GND |
 
@@ -83,14 +83,14 @@ The selected sensor is the AS608 / JM-101B profile documented by the product spe
 
 Do not connect this JM-101B to 5 V unless the exact physical board and its manufacturer documentation independently confirm 5 V tolerance. For the sensor selected in this project, the documented and recommended VCC is 3.3 V. Incorrect sensor power can prevent detection even when the UART code and wiring are correct.
 
-### 20x4 I2C LCD to ESP32
+### 16x2 I2C LCD to ESP32
 
 | I2C LCD | ESP32 |
 | --- | --- |
 | GND | GND |
 | VCC | External 5 V through a bidirectional I2C level shifter, or a confirmed-safe module arrangement |
-| SDA | Level shifter → GPIO 21 |
-| SCL | Level shifter → GPIO 22 |
+| SDA | Level shifter → GPIO 14 |
+| SCL | Level shifter → GPIO 27 |
 
 All devices must share common ground.
 
@@ -134,10 +134,10 @@ The closed angle is 0° and the open angle is 90°. Never power the servo from E
 | --- | --- |
 | VCC | 5 V |
 | GND | Common GND |
-| TRIG | GPIO 33 |
-| ECHO | GPIO 34 through a voltage divider |
+| TRIG | GPIO 21 |
+| ECHO | GPIO 22 through a voltage divider |
 
-HC-SR04 ECHO is normally 5 V and must not connect directly to the ESP32. Use, for example, 1kΩ from ECHO to GPIO 34 and 2kΩ from GPIO 34 to GND to reduce the signal to approximately 3.3 V.
+HC-SR04 ECHO is normally 5 V and must not connect directly to the ESP32. Use, for example, 1kΩ from ECHO to GPIO 22 and 2kΩ from GPIO 22 to GND to reduce the signal to approximately 3.3 V.
 
 ### USB-C / external 5 V module
 
@@ -275,8 +275,8 @@ The LCD defaults to I2C address `0x27`:
 ```cpp
 // If the LCD does not work with 0x27, try 0x3F.
 #define LCD_ADDRESS 0x27
-#define LCD_COLUMNS 20
-#define LCD_ROWS 4
+#define LCD_COLUMNS 16
+#define LCD_ROWS 2
 ```
 
 If the LCD is not detected, check its wiring and change `LCD_ADDRESS` to `0x3F`. The startup Serial output reports whether the configured address responded.
@@ -308,7 +308,7 @@ If the LCD is not detected, check its wiring and change `LCD_ADDRESS` to `0x3F`.
 
 Fingerprint reading happens only after `R`, so the idle loop does not flood the Serial Monitor.
 
-Important states continue to print in full on Serial Monitor and appear in shortened English messages on the 20x4 LCD. Each row is safely limited to 20 characters. The display helper caches all four rendered rows and skips identical updates, preventing repeated `lcd.clear()` calls and visible flicker during the fast loop.
+Important states continue to print in full on Serial Monitor and appear as compact English messages on the 16x2 LCD. Each row is safely limited to 16 characters. The display helper caches both rendered rows and skips identical updates, preventing repeated `lcd.clear()` calls and visible flicker during the fast loop.
 
 ## Alert patterns
 
@@ -358,8 +358,8 @@ The failed-attempt counter saturates at `3/3` while locked. Further access attem
 - `D` sends 0°, 90°, and 0° commands with visible delays. A three-wire servo has no feedback signal, so successful PWM attachment does not prove that the motor physically moved.
 - `U` takes ten measurements using a 30 ms Echo timeout, reports every timeout, and averages only valid readings.
 - `W` prints the exact AS608/JM-101B profile, 3.3 V expectation, UART GPIO16/17, 57600 baud, and unused USB D+/D-; it then repeats fingerprint detection, takes ten ultrasonic readings, checks servo attachment without moving it, checks RFID/LCD status and GPIO conflicts, and prints `READY` or `NOT READY`. It snapshots and restores selected area, Entry/Exit mode, lockdown, Admin Mode, failed attempts, enrollment state, door software state, presence-prompt state, every attendance mask, and the LCD cache.
-- Commands `F`, `P`, `D`, `U`, and `W` run through the diagnostic state guard. Their diagnostic LCD screens are temporary; after the command completes, the guard redraws the previous four-line LCD screen and restores its cached text/timestamp.
-- GPIO 34 is input-only and is correctly used for HC-SR04 Echo. Echo must pass through a voltage divider because its raw output is normally 5 V.
+- Commands `F`, `P`, `D`, `U`, and `W` run through the diagnostic state guard. Their diagnostic LCD screens are temporary; after the command completes, the guard redraws the previous two-line LCD screen and restores its cached text/timestamp.
+- GPIO 22 receives HC-SR04 Echo through a voltage divider because the sensor's raw Echo output is normally 5 V.
 - The servo must use a stable external 5 V supply. Join the external supply GND to ESP32 GND, but do not blindly join external +5 V to an ESP32 that is already USB-powered.
 - The selected JM-101B is specified at about 60 mA from 3.3 V. If fingerprint failures appear when the externally powered servo moves, measure both the ESP32 3.3 V rail and servo 5 V rail and verify the common ground.
 - A USB-C PD/QC module must be measured and confirmed at 5 V before connection; an accidental 9 V, 12 V, or 20 V output can damage the project.
@@ -373,7 +373,7 @@ Command `V` runs isolated mini tests without scanning RFID, capturing a fingerpr
 - all six exact user permission profiles, including all restricted Company, Server Room, and Management/Admin combinations;
 - occupancy-bit independence, entry, duplicate-entry rejection, exit, already-outside rejection, and re-entry;
 - failure-counter thresholds and saturation, lockdown state, Admin unlock, counter reset, and Admin Mode timeout boundaries;
-- LCD 20x4 sizing, 20-character trimming, and duplicate-screen refresh suppression;
+- LCD 16x2 sizing, 16-character trimming, and duplicate-screen refresh suppression;
 - attendance commit only after door state `OPEN`, servo angles, and the five-second/clear-area door-closing rules;
 - 20 cm presence calculations and the different Entry/Exit ultrasonic policies;
 - the AS608/JM-101B model, 3.3 V/about-60 mA profile, fingerprint UART2/pin/57600 contract, simple servo attach default, servo GPIO13 versus RFID SCK GPIO18, Serial command uniqueness including `W`, area mappings, and GPIO conflicts.
@@ -397,8 +397,8 @@ The normal access flow opens the servo only after granted entry or exit. Command
 - [ ] JM-101B GND is connected to ESP32 GND; UART TX → GPIO 16 and UART RX → GPIO 17
 - [ ] Any JM-101B USB D+ and D- pins are left disconnected from the ESP32
 - [ ] HC-SR04 is powered from 5 V
-- [ ] HC-SR04 ECHO → 1 kΩ → GPIO 34, with 2 kΩ from GPIO 34 → GND (or an equivalent 3.3 V-safe level shifter)
-- [ ] LCD is a 20x4 I2C display and SDA/SCL idle voltages were checked before connection
+- [ ] HC-SR04 ECHO → 1 kΩ → GPIO 22, with 2 kΩ from GPIO 22 → GND (or an equivalent 3.3 V-safe level shifter)
+- [ ] LCD is a 16x2 I2C display and SDA/SCL idle voltages were checked before connection
 - [ ] A bidirectional I2C level shifter is installed if the 5 V backpack pulls SDA/SCL above 3.3 V
 - [ ] Red GPIO 25 and green GPIO 32 LEDs each have a 220 Ω or 330 Ω series resistor
 - [ ] Buzzer voltage/current was checked; an unknown or high-current buzzer uses a transistor/MOSFET driver
@@ -415,7 +415,7 @@ The normal access flow opens the servo only after granted entry or exit. Command
 
 - Each user has a seven-area `insideMask`; entry and exit change only the selected area's bit.
 - A permitted entry changes that user's selected-area state from `OUTSIDE` to `INSIDE` only after the software confirms that the authorized door-open command reached the `OPEN` state.
-- Entry is denied if that user is already `INSIDE` the selected area. The LCD shows `Already Inside`, and the normal denial alert and failed-attempt rules apply.
+- Entry is denied if that user is already `INSIDE` the selected area. The LCD shows `ALREADY INSIDE`, and the normal denial alert and failed-attempt rules apply.
 - Exit changes the state to `OUTSIDE` only when the user is currently inside the selected area.
 - Exit does not require ultrasonic presence. An already-outside exit keeps the servo closed, displays `Not Inside`, and returns to Entry Mode without incrementing the failure counter.
 - Command `S` prints every user's status in all seven areas followed by live occupancy counts.
@@ -441,14 +441,14 @@ Enroll a physical fingerprint using one of these IDs to test its matching permis
 3. Replace the placeholder in the sketch:
 
 ```cpp
-const String ADMIN_RFID_UID = "PUT_ADMIN_CARD_UID_HERE";
+const String ADMIN_RFID_UID = "47469C2E";
 ```
 
 4. Upload the sketch again.
 
 The RFID admin identity is separate from fingerprint users. It enables Admin Mode and is the only identity that can clear Lockdown Mode.
 
-> Configure and test `ADMIN_RFID_UID` before deliberately triggering Lockdown Mode. When the placeholder is still present, scanned UIDs are printed for configuration but no card can unlock the system.
+> The configured Admin Master Card UID is `47469C2E`. Test this card before deliberately triggering Lockdown Mode; scanned UIDs continue to print in Serial Monitor for verification.
 
 ## Final staged hardware test order
 

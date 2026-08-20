@@ -127,36 +127,36 @@ void loop() {
 
 // If the LCD does not work with 0x27, try 0x3F.
 #define LCD_ADDRESS 0x27
-#define LCD_COLUMNS 20
-#define LCD_ROWS 4
+#define LCD_COLUMNS 16
+#define LCD_ROWS 2
 #define RED_LED_PIN 25
 #define BUZZER_PIN 26
 #define GREEN_LED_PIN 32
 #define SERVO_PIN 13
 #define SERVO_USE_SIMPLE_ATTACH 1
-#define ULTRASONIC_TRIG_PIN 33
-#define ULTRASONIC_ECHO_PIN 34
+#define ULTRASONIC_TRIG_PIN 21
+#define ULTRASONIC_ECHO_PIN 22
 
 /*
   HC-SR04 WARNING:
-  ECHO is a 5V signal. Never connect it directly to ESP32 GPIO34.
+  ECHO is a 5V signal. Never connect it directly to ESP32 GPIO22.
   Use a voltage divider or a 3.3V-safe level shifter.
 */
 
 // Dedicated pin map: every GPIO below has one component role only.
-// GPIO 34 is input-only and is used only for the HC-SR04 Echo signal.
-// GPIO 21/22 are LCD I2C, GPIO 16/17 are fingerprint UART2, and GPIO 13
-// is the servo PWM signal. validatePinAssignments() checks for duplicates.
+// GPIO 21/22 are ultrasonic Trigger/Echo, GPIO 14/27 are LCD I2C,
+// GPIO 16/17 are fingerprint UART2, and GPIO 13 is the servo PWM signal.
+// validatePinAssignments() checks for duplicates.
 // RFID RC522 pins (ESP32 VSPI)
 // POWER WARNING: RC522 VCC is 3.3V only; never connect it to 5V.
 constexpr uint8_t RFID_SS_PIN = 5;
 constexpr uint8_t RFID_SCK_PIN = 18;
 constexpr uint8_t RFID_MOSI_PIN = 23;
 constexpr uint8_t RFID_MISO_PIN = 19;
-constexpr uint8_t RFID_RST_PIN = 27;
+constexpr uint8_t RFID_RST_PIN = 33;
 
-constexpr uint8_t LCD_SDA_PIN = 21;
-constexpr uint8_t LCD_SCL_PIN = 22;
+constexpr uint8_t LCD_SDA_PIN = 14;
+constexpr uint8_t LCD_SCL_PIN = 27;
 
 /*
   LCD I2C VOLTAGE NOTE:
@@ -247,8 +247,6 @@ struct AccessControlStateSnapshot {
   unsigned long lastLCDMessageAt;
   String lcdLine1;
   String lcdLine2;
-  String lcdLine3;
-  String lcdLine4;
   uint16_t insideMasks[USER_COUNT];
 };
 
@@ -295,8 +293,6 @@ bool presencePromptVisible = false;
 unsigned long lastLCDMessageAt = 0;
 String lastLcdLine1 = "";
 String lastLcdLine2 = "";
-String lastLcdLine3 = "";
-String lastLcdLine4 = "";
 
 void setup();
 void loop();
@@ -392,15 +388,10 @@ void lcdShowDoorOpen(bool exitMode);
 void lcdShowDoorClosed();
 void lcdShowSystemLocked();
 void lcdShowAdminMode();
-void lcdShowMessage(String line1,
-                    String line2 = "",
-                    String line3 = "",
-                    String line4 = "");
+void lcdShowMessage(String line1, String line2 = "");
 String getLCDLine(String text);
 bool isLCDMessageUnchanged(const String& line1,
-                           const String& line2,
-                           const String& line3,
-                           const String& line4);
+                           const String& line2);
 String getLCDAreaName(Area area);
 
 void setupRFID();
@@ -471,7 +462,7 @@ void setup() {
   Serial.println("- ESP32 DEV KIT V1");
   Serial.println("- RFID RC522");
   Serial.println("- Fingerprint Sensor");
-  Serial.println("- I2C LCD 20x4");
+  Serial.println("- I2C LCD 16x2");
   Serial.println("- Red LED");
   Serial.println("- Active Buzzer");
   Serial.println("- Green LED");
@@ -780,7 +771,7 @@ void testAlerts() {
   Serial.println();
   Serial.println("[ALERT TEST]");
   Serial.println("Testing Red LED and active buzzer.");
-  lcdShowMessage("ALERT TEST", "Red LED + Buzzer", "Testing Outputs", "Please Wait");
+  lcdShowMessage("ALERT TEST", "LED + BUZZER");
 
   digitalWrite(RED_LED_PIN, HIGH);
   beepOnce(300);
@@ -821,7 +812,7 @@ void testGreenLed() {
   Serial.println();
   Serial.println("[GREEN LED TEST]");
   Serial.println("Testing Green LED on GPIO 32.");
-  lcdShowMessage("GREEN LED TEST", "GPIO 32", "Testing Output", "Please Wait");
+  lcdShowMessage("GREEN LED TEST", "GPIO32 ACTIVE");
   greenLedOn(750);
   Serial.println("[GREEN LED TEST] Complete");
   Serial.println();
@@ -892,10 +883,7 @@ void unlockSystem() {
   Serial.println(doorOpen ? "OPEN (unchanged)" : "CLOSED");
   Serial.println();
 
-  lcdShowMessage("SYSTEM UNLOCKED",
-                 "Admin Verified",
-                 "Failed Reset: 0",
-                 "System Active");
+  lcdShowMessage("SYSTEM UNLOCKED", "ADMIN VERIFIED");
   triggerAccessGrantedFeedback();
 }
 
@@ -942,7 +930,7 @@ void checkAdminModeTimeout() {
   Serial.println();
   Serial.println("[ADMIN MODE EXPIRED]");
   Serial.println();
-  lcdShowMessage("ADMIN MODE", "Expired", "Enrollment Blocked", "Scan Admin RFID");
+  lcdShowMessage("ADMIN EXPIRED", "SCAN ADMIN RFID");
 }
 
 bool hasAdminModeExpired(unsigned long now) {
@@ -990,11 +978,9 @@ void handleUnknownRFID(String uid) {
   } else if (!systemLocked) {
     lcdShowRFIDStatus("Unknown RFID", "Access Denied");
     triggerAccessDeniedAlert();
-    lcdShowMessage("ACCESS DENIED",
-                   "Unknown RFID",
-                   "Failed: " + String(failedAttempts) + "/" +
-                       String(MAX_FAILED_ATTEMPTS),
-                   "Door Closed");
+    lcdShowMessage("UNKNOWN RFID",
+                   "FAILED " + String(failedAttempts) + "/" +
+                       String(MAX_FAILED_ATTEMPTS));
   }
 
   Serial.println();
@@ -1255,10 +1241,7 @@ void updatePresencePrompt() {
 
   bool personNear = isPersonNear();
   if (personNear && !presencePromptVisible) {
-    lcdShowMessage("PERSON DETECTED",
-                   "Place Finger",
-                   "Press R to Scan",
-                   "Door Closed");
+    lcdShowMessage("PERSON DETECTED", "PRESS R TO SCAN");
     presencePromptVisible = true;
   } else if (!personNear && presencePromptVisible) {
     lcdShowMenu();
@@ -1294,7 +1277,7 @@ void testDoor() {
     return;
   }
 
-  lcdShowMessage("SERVO TEST", "Open 90 deg", "Close 0 deg", "Check Motor");
+  lcdShowMessage("SERVO TEST", "0-90-0 DEGREES");
   Serial.println("Moving to 0 degrees");
   doorServo.write(DOOR_CLOSED_ANGLE);
   doorOpen = false;
@@ -1315,7 +1298,7 @@ void testDoor() {
   Serial.println("Test complete.");
   Serial.println("If the servo did not move, check stable 5 V power, signal GPIO 13, and common GND.");
   Serial.println("The ESP32 can confirm PWM output, but a three-wire servo provides no position feedback.");
-  lcdShowMessage("SERVO TEST", "Test Complete", "Door Command: 0", "Check Motor");
+  lcdShowMessage("SERVO TEST", "TEST COMPLETE");
   Serial.println();
 }
 
@@ -1358,9 +1341,9 @@ void printUltrasonicStatus() {
     lastDistanceCm = -1.0;
     Serial.println("[ULTRASONIC ERROR]");
     Serial.println("No echo received in any of the 10 readings.");
-    Serial.println("Check TRIG GPIO 33, ECHO GPIO 34, 5 V, common GND, and the Echo voltage divider.");
-    Serial.println("GPIO 34 is input-only, which is correct for HC-SR04 Echo.");
-    lcdShowMessage("ULTRA ERROR", "No Echo Received", "Check Wiring", "See Serial");
+    Serial.println("Check TRIG GPIO 21, ECHO GPIO 22, 5 V, common GND, and the Echo voltage divider.");
+    Serial.println("HC-SR04 Echo must reach GPIO 22 through 3.3 V level protection.");
+    lcdShowMessage("ULTRA ERROR", "NO ECHO");
   } else {
     lastDistanceCm = distanceTotal / validReadings;
     bool personNear = lastDistanceCm <= PRESENCE_DISTANCE_CM;
@@ -1373,10 +1356,8 @@ void printUltrasonicStatus() {
     Serial.println(" cm");
     Serial.print("Person Near: ");
     Serial.println(personNear ? "YES" : "NO");
-    lcdShowMessage("ULTRA TEST",
-                   "Dist: " + String(lastDistanceCm, 1) + " cm",
-                   "Near: " + String(personNear ? "YES" : "NO"),
-                   "See Serial");
+    lcdShowMessage("ULTRA " + String(personNear ? "NEAR" : "CLEAR"),
+                   String(lastDistanceCm, 1) + " CM");
   }
   Serial.println();
 }
@@ -1413,174 +1394,111 @@ void setupLCD() {
 }
 
 void lcdShowWelcome() {
-  lcdShowMessage("Smart Access System",
-                 "ESP32 Ready",
-                 "RFID + Fingerprint",
-                 "Choose Area 1-7");
+  lcdShowMessage("SMART ACCESS", "ESP32 READY");
 }
 
 void lcdShowMenu() {
-  lcdShowMessage("SMART ACCESS SYSTEM",
-                 "System Ready",
-                 "Choose Area",
-                 "1-7 Serial");
+  lcdShowMessage("SYSTEM READY", "SELECT AREA 1-7");
 }
 
 void lcdShowSelectedArea(Area area) {
-  lcdShowMessage("AREA SELECTED",
-                 getLCDAreaName(area),
-                 area == SERVER_ROOM ? "Security Area" : "Press R to Scan",
-                 area == SERVER_ROOM ? "Press R to Scan" : "X for Exit Mode");
+  lcdShowMessage(getLCDAreaName(area), "R=SCAN X=EXIT");
 }
 
 void lcdShowEnrollStart() {
-  lcdShowMessage("ENROLL MODE",
-                 "Enter ID in Serial",
-                 "Valid Range: 1-127",
-                 "Admin Mode Active");
+  lcdShowMessage("ENROLL MODE", "ID 1-127 SERIAL");
 }
 
 void lcdShowEnrollStep(String line1, String line2) {
-  lcdShowMessage("FINGERPRINT ENROLL", line1, line2, "Please Wait");
+  lcdShowMessage(line1, line2);
 }
 
 void lcdShowEnrollSuccess(int id) {
-  lcdShowMessage("ENROLL SUCCESS",
-                 "Fingerprint Saved",
-                 "ID: " + String(id),
-                 "Admin Mode Active");
+  lcdShowMessage("ENROLL SUCCESS", "ID " + String(id) + " SAVED");
 }
 
 void lcdShowEnrollFailed(String shortReason) {
-  lcdShowMessage("ENROLL FAILED", shortReason, "Try Again", "Check Serial");
+  lcdShowMessage("ENROLL FAILED", shortReason);
 }
 
 void lcdShowPlaceFinger() {
-  lcdShowMessage("PLACE FINGER",
-                 "Scanning...",
-                 "Area: " + getLCDAreaName(selectedArea),
-                 "Please Wait");
+  lcdShowMessage("PLACE FINGER", "SCANNING...");
 }
 
 void lcdShowAccessGranted(User* user, Area area) {
   String userName = user == nullptr ? "Authorized User" : user->name;
-  lcdShowMessage("ACCESS GRANTED",
-                 "User: " + userName,
-                 "Area: " + getLCDAreaName(area),
-                 "Door Opening");
+  lcdShowMessage("ACCESS GRANTED", userName);
 }
 
 void lcdShowAccessDenied(String reason) {
   if (reason.indexOf("not recognized") >= 0) {
-    lcdShowMessage("ACCESS DENIED",
-                   "Unknown Finger",
-                   "Try Again",
-                   "Door Closed");
+    lcdShowMessage("ACCESS DENIED", "UNKNOWN FINGER");
   } else if (reason.indexOf("not configured") >= 0) {
-    lcdShowMessage("ACCESS DENIED",
-                   "Unknown User",
-                   "Check Configuration",
-                   "Door Closed");
+    lcdShowMessage("ACCESS DENIED", "UNKNOWN USER");
   } else if (reason.indexOf("not allowed") >= 0) {
-    lcdShowMessage("ACCESS DENIED",
-                   "No Permission",
-                   "Area: " + getLCDAreaName(selectedArea),
-                   "Door Closed");
+    lcdShowMessage("ACCESS DENIED", "NO PERMISSION");
   } else if (reason.indexOf("already inside") >= 0) {
-    lcdShowMessage("ACCESS DENIED",
-                   "Already Inside",
-                   "Use Exit Mode",
-                   "Door Closed");
+    lcdShowMessage("ACCESS DENIED", "ALREADY INSIDE");
   } else if (reason.indexOf("not inside") >= 0) {
-    lcdShowMessage("EXIT DENIED",
-                   "Not Inside",
-                   "Use Entry First",
-                   "Door Closed");
+    lcdShowMessage("EXIT DENIED", "NOT INSIDE");
   } else if (reason.indexOf("Timed out") >= 0) {
-    lcdShowMessage("ACCESS DENIED",
-                   "Scan Timeout",
-                   "Try Again",
-                   "Door Closed");
+    lcdShowMessage("ACCESS DENIED", "SCAN TIMEOUT");
   } else if (reason.indexOf("not detected") >= 0) {
-    lcdShowMessage("FINGER SENSOR",
-                   "Not Found",
-                   "Check Wiring/UART",
-                   "Access Blocked");
+    lcdShowMessage("FINGER SENSOR", "NOT FOUND");
   } else {
-    lcdShowMessage("ACCESS DENIED", "Try Again", "Check Serial", "Door Closed");
+    lcdShowMessage("ACCESS DENIED", "TRY AGAIN");
   }
 }
 
 void lcdShowRFIDStatus(String line1, String line2) {
-  lcdShowMessage("RFID STATUS", line1, line2, "Check Serial");
+  lcdShowMessage(line1, line2);
 }
 
 void lcdShowError(String line1, String line2) {
-  lcdShowMessage("ERROR", line1, line2, "Check Serial");
+  lcdShowMessage(line1, line2);
 }
 
 void lcdShowDoorOpen(bool exitMode) {
-  lcdShowMessage("DOOR OPEN",
-                 exitMode ? "Please Exit" : "Please Enter",
-                 "Waiting Clear",
-                 "Auto Close Soon");
+  lcdShowMessage("DOOR OPEN", exitMode ? "PLEASE EXIT" : "PLEASE ENTER");
 }
 
 void lcdShowDoorClosed() {
-  lcdShowMessage("DOOR CLOSED", "System Ready", "Choose Area", "1-7 Serial");
+  lcdShowMessage("DOOR CLOSED", "SELECT AREA 1-7");
 }
 
 void lcdShowSystemLocked() {
-  lcdShowMessage("SYSTEM LOCKED",
-                 "Failed: " + String(failedAttempts) + "/" +
-                     String(MAX_FAILED_ATTEMPTS),
-                 "Scan Admin RFID",
-                 "Access Blocked");
+  lcdShowMessage("SYSTEM LOCKED", "SCAN ADMIN RFID");
 }
 
 void lcdShowAdminMode() {
-  lcdShowMessage("ADMIN MODE", "Enabled", "Enroll Allowed", "60 sec Timeout");
+  lcdShowMessage("ADMIN MODE", "ENABLED 60 SEC");
 }
 
-void lcdShowMessage(String line1,
-                    String line2,
-                    String line3,
-                    String line4) {
+void lcdShowMessage(String line1, String line2) {
   if (!lcdInitialized) {
     return;
   }
 
   line1 = getLCDLine(line1);
   line2 = getLCDLine(line2);
-  line3 = getLCDLine(line3);
-  line4 = getLCDLine(line4);
 
-  if (isLCDMessageUnchanged(line1, line2, line3, line4)) {
+  if (isLCDMessageUnchanged(line1, line2)) {
     return;
   }
 
   lastLcdLine1 = line1;
   lastLcdLine2 = line2;
-  lastLcdLine3 = line3;
-  lastLcdLine4 = line4;
   lastLCDMessageAt = millis();
   lcd.clear();
   lcd.setCursor(0, 0);
   lcd.print(line1);
   lcd.setCursor(0, 1);
   lcd.print(line2);
-  lcd.setCursor(0, 2);
-  lcd.print(line3);
-  lcd.setCursor(0, 3);
-  lcd.print(line4);
 }
 
 bool isLCDMessageUnchanged(const String& line1,
-                           const String& line2,
-                           const String& line3,
-                           const String& line4) {
-  return line1 == lastLcdLine1 && line2 == lastLcdLine2 &&
-         line3 == lastLcdLine3 && line4 == lastLcdLine4;
+                           const String& line2) {
+  return line1 == lastLcdLine1 && line2 == lastLcdLine2;
 }
 
 String getLCDLine(String text) {
@@ -1706,9 +1624,9 @@ void printHardwareSelfTest() {
   Serial.println();
 
   lcdShowMessage("HW SELF TEST",
-                 rfidInitialized ? "RFID: OK" : "RFID: FAIL",
-                 fingerprintReady ? "Finger: OK" : "Finger: FAIL",
-                 lcdInitialized ? "LCD: OK" : "LCD: FAIL");
+                 rfidInitialized && fingerprintReady && lcdInitialized
+                     ? "CORE DEVICES OK"
+                     : "CHECK SERIAL");
 }
 
 AccessControlStateSnapshot captureAccessControlState() {
@@ -1726,8 +1644,6 @@ AccessControlStateSnapshot captureAccessControlState() {
   snapshot.lastLCDMessageAt = lastLCDMessageAt;
   snapshot.lcdLine1 = lastLcdLine1;
   snapshot.lcdLine2 = lastLcdLine2;
-  snapshot.lcdLine3 = lastLcdLine3;
-  snapshot.lcdLine4 = lastLcdLine4;
   for (size_t i = 0; i < USER_COUNT; ++i) {
     snapshot.insideMasks[i] = users[i].insideMask;
   }
@@ -1755,9 +1671,7 @@ bool isAccessControlStateUnchanged(
 bool isLCDCacheUnchanged(const AccessControlStateSnapshot& snapshot) {
   return lastLCDMessageAt == snapshot.lastLCDMessageAt &&
          lastLcdLine1 == snapshot.lcdLine1 &&
-         lastLcdLine2 == snapshot.lcdLine2 &&
-         lastLcdLine3 == snapshot.lcdLine3 &&
-         lastLcdLine4 == snapshot.lcdLine4;
+         lastLcdLine2 == snapshot.lcdLine2;
 }
 
 void restoreAccessControlState(const AccessControlStateSnapshot& snapshot) {
@@ -1774,8 +1688,6 @@ void restoreAccessControlState(const AccessControlStateSnapshot& snapshot) {
   lastLCDMessageAt = snapshot.lastLCDMessageAt;
   lastLcdLine1 = snapshot.lcdLine1;
   lastLcdLine2 = snapshot.lcdLine2;
-  lastLcdLine3 = snapshot.lcdLine3;
-  lastLcdLine4 = snapshot.lcdLine4;
   for (size_t i = 0; i < USER_COUNT; ++i) {
     users[i].insideMask = snapshot.insideMasks[i];
   }
@@ -1785,10 +1697,7 @@ void restoreDiagnosticLCD(const AccessControlStateSnapshot& snapshot) {
   if (lcdInitialized && !isLCDCacheUnchanged(snapshot)) {
     // Redraw the pre-diagnostic screen while the diagnostic cache is still
     // active. restoreAccessControlState() then restores the original timestamp.
-    lcdShowMessage(snapshot.lcdLine1,
-                   snapshot.lcdLine2,
-                   snapshot.lcdLine3,
-                   snapshot.lcdLine4);
+    lcdShowMessage(snapshot.lcdLine1, snapshot.lcdLine2);
   }
 }
 
@@ -1841,7 +1750,7 @@ void runHardwareReadinessCheck() {
   Serial.println("Servo movement test: use D");
   Serial.print("RFID: ");
   Serial.println(rfidInitialized ? "OK" : "FAIL");
-  Serial.print("LCD 20x4: ");
+  Serial.print("LCD 16x2: ");
   Serial.println(lcdInitialized ? "OK" : "FAIL");
   Serial.print("GPIO conflicts: ");
   Serial.println(gpioOK ? "none" : "FOUND");
@@ -1852,10 +1761,7 @@ void runHardwareReadinessCheck() {
   Serial.println(ready ? "READY" : "NOT READY");
   Serial.println();
 
-  lcdShowMessage("HW READINESS",
-                 fingerprintOK ? "Finger: OK" : "Finger: FAIL",
-                 ultrasonicOK ? "Ultra: OK" : "Ultra: FAIL",
-                 ready ? "READY" : "NOT READY");
+  lcdShowMessage("HW READINESS", ready ? "READY" : "NOT READY");
 }
 
 void runStateGuardedDiagnostic(char command) {
@@ -1926,8 +1832,6 @@ void runSoftwareValidation() {
   unsigned long savedLastLCDMessageAt = lastLCDMessageAt;
   String savedLcdLine1 = lastLcdLine1;
   String savedLcdLine2 = lastLcdLine2;
-  String savedLcdLine3 = lastLcdLine3;
-  String savedLcdLine4 = lastLcdLine4;
 
   auto validate = [&](const String& name,
                       bool passed,
@@ -2314,14 +2218,14 @@ void runSoftwareValidation() {
            "blocked",
            "allowed");
 
-  validate("LCD dimensions are 20x4",
-           LCD_COLUMNS == 20 && LCD_ROWS == 4,
-           "20 columns, 4 rows",
+  validate("LCD dimensions are 16x2",
+           LCD_COLUMNS == 16 && LCD_ROWS == 2,
+           "16 columns, 2 rows",
            String(LCD_COLUMNS) + "x" + String(LCD_ROWS));
-  String trimmedLCDLine = getLCDLine("1234567890123456789012345");
-  validate("LCD long lines are trimmed to 20 characters",
+  String trimmedLCDLine = getLCDLine("12345678901234567890");
+  validate("LCD long lines are trimmed to 16 characters",
            trimmedLCDLine.length() == LCD_COLUMNS,
-           "20 characters",
+           "16 characters",
            String(trimmedLCDLine.length()) + " characters");
   validate("LCD short lines remain unchanged",
            getLCDLine("System Ready") == "System Ready",
@@ -2329,14 +2233,12 @@ void runSoftwareValidation() {
            getLCDLine("System Ready"));
   lastLcdLine1 = "A";
   lastLcdLine2 = "B";
-  lastLcdLine3 = "C";
-  lastLcdLine4 = "D";
   validate("LCD duplicate screen detection prevents refresh",
-           isLCDMessageUnchanged("A", "B", "C", "D"),
+           isLCDMessageUnchanged("A", "B"),
            "unchanged",
            "changed");
   validate("LCD changed screen requests refresh",
-           !isLCDMessageUnchanged("A", "B", "C", "Different"),
+           !isLCDMessageUnchanged("A", "Different"),
            "changed",
            "unchanged");
 
@@ -2512,8 +2414,6 @@ void runSoftwareValidation() {
   lastLCDMessageAt = savedLastLCDMessageAt;
   lastLcdLine1 = savedLcdLine1;
   lastLcdLine2 = savedLcdLine2;
-  lastLcdLine3 = savedLcdLine3;
-  lastLcdLine4 = savedLcdLine4;
 
   Serial.println("[SOFTWARE VALIDATION END]");
   Serial.println("====================================");
@@ -2615,9 +2515,7 @@ void printSystemStatus() {
   printAllInsideStatus();
   Serial.println();
   lcdShowMessage("SYSTEM STATUS",
-                 "Check Serial",
-                 "Users + Occupancy",
-                 systemLocked ? "System Locked" : "System Active");
+                 systemLocked ? "SYSTEM LOCKED" : "CHECK SERIAL");
 }
 
 void setupRFID() {
@@ -2721,10 +2619,7 @@ bool runFingerprintStandaloneStyleTest() {
     Serial.println("- GND");
     Serial.println("- UART TX/RX wiring (not USB D+/D-)");
     Serial.println("- Baud rate");
-    lcdShowMessage("FINGER ERROR",
-                   "AS608 Missing",
-                   "Check Wiring",
-                   "See Serial");
+    lcdShowMessage("FINGER ERROR", "JM-101B MISSING");
     return false;
   }
 
@@ -2732,19 +2627,13 @@ bool runFingerprintStandaloneStyleTest() {
   fingerprintWorkingBaud = FINGERPRINT_PRIMARY_BAUD;
   Serial.println("SUCCESS: AS608 / JM-101B detected!");
   printFingerprintParameters();
-  lcdShowMessage("FINGERPRINT OK",
-                 "AS608 Detected",
-                 "Baud: 57600",
-                 "Ready");
+  lcdShowMessage("FINGERPRINT OK", "57600 BAUD");
   Serial.println();
   return true;
 }
 
 bool setupFingerprintWithBaudScan() {
-  lcdShowMessage("FINGER TEST",
-                 "Working Test Setup",
-                 "UART2 GPIO 16/17",
-                 "Baud: 57600");
+  lcdShowMessage("FINGER TEST", "UART2 57600");
 
   if (runFingerprintStandaloneStyleTest()) {
     return true;
@@ -2766,10 +2655,7 @@ bool setupFingerprintWithBaudScan() {
       Serial.print("[FINGERPRINT] SUCCESS: AS608 detected at fallback baud ");
       Serial.println(baudRate);
       printFingerprintParameters();
-      lcdShowMessage("FINGERPRINT OK",
-                     "AS608 Detected",
-                     "Baud: " + String(baudRate),
-                     "Ready");
+      lcdShowMessage("FINGERPRINT OK", String(baudRate) + " BAUD");
       Serial.println();
       return true;
     }
@@ -2785,10 +2671,7 @@ bool setupFingerprintWithBaudScan() {
   Serial.println("- USB D+/D- left disconnected");
   Serial.println("- Baud rate and default password");
   Serial.println();
-  lcdShowMessage("FINGER ERROR",
-                 "AS608 Missing",
-                 "Check Wiring",
-                 "See Serial");
+  lcdShowMessage("FINGER ERROR", "JM-101B MISSING");
   return false;
 }
 
@@ -2843,27 +2726,24 @@ void testSimpleFingerprintScan() {
   if (!fingerprintReady) {
     Serial.println("ERROR: AS608 is not initialized.");
     Serial.println("Run F to repeat the working-test detection method.");
-    lcdShowMessage("FINGER ERROR",
-                   "AS608 Missing",
-                   "Press F to Test",
-                   "See Serial");
+    lcdShowMessage("FINGER ERROR", "PRESS F TO TEST");
     return;
   }
 
   Serial.println("Place a finger on the sensor (15 second timeout)...");
-  lcdShowMessage("PLACE FINGER", "Scanning...", "Please Wait", "Test Mode");
+  lcdShowMessage("PLACE FINGER", "SCANNING...");
 
   uint8_t result = FINGERPRINT_NOFINGER;
   if (!waitForFingerImage(FINGERPRINT_CAPTURE_TIMEOUT_MS, result)) {
     Serial.println("Scan timeout: no finger detected.");
-    lcdShowMessage("FINGER TEST", "Scan Timeout", "No Finger", "Try Again");
+    lcdShowMessage("FINGER TEST", "SCAN TIMEOUT");
     return;
   }
 
   if (result != FINGERPRINT_OK) {
     Serial.print("Image capture error: ");
     Serial.println(getFingerprintError(result));
-    lcdShowMessage("FINGER ERROR", "Capture Failed", "Check Serial", "Try Again");
+    lcdShowMessage("FINGER ERROR", "CAPTURE FAILED");
     return;
   }
 
@@ -2872,7 +2752,7 @@ void testSimpleFingerprintScan() {
   if (result != FINGERPRINT_OK) {
     Serial.print("Image conversion error: ");
     Serial.println(getFingerprintError(result));
-    lcdShowMessage("FINGER ERROR", "Bad Image", "Try Again", "See Serial");
+    lcdShowMessage("FINGER ERROR", "BAD IMAGE");
     return;
   }
 
@@ -2885,21 +2765,20 @@ void testSimpleFingerprintScan() {
     Serial.print("Confidence: ");
     Serial.println(finger.confidence);
     lcdShowMessage("FINGER MATCH",
-                   "ID: " + String(finger.fingerID),
-                   "Confidence: " + String(finger.confidence),
-                   "Scan Test Only");
+                   "ID " + String(finger.fingerID) + " C " +
+                       String(finger.confidence));
     return;
   }
 
   if (result == FINGERPRINT_NOTFOUND) {
     Serial.println("Fingerprint not found in database.");
-    lcdShowMessage("NO FINGER MATCH", "Not In Database", "Test Complete", "Try Another");
+    lcdShowMessage("NO FINGER MATCH", "NOT IN DATABASE");
     return;
   }
 
   Serial.print("Search error: ");
   Serial.println(result);
-  lcdShowMessage("FINGER ERROR", "Search Failed", "Check Serial", "Try Again");
+  lcdShowMessage("FINGER ERROR", "SEARCH FAILED");
 }
 
 bool enrollFingerprint(int id) {
@@ -2916,10 +2795,7 @@ bool enrollFingerprint(int id) {
     Serial.println("[ADMIN REQUIRED]");
     Serial.println("Enrollment is allowed only in Admin Mode.");
     Serial.println("Scan the Admin RFID card first.");
-    lcdShowMessage("ADMIN REQUIRED",
-                   "Scan Admin RFID",
-                   "Enrollment Blocked",
-                   "Access Denied");
+    lcdShowMessage("ADMIN REQUIRED", "SCAN ADMIN RFID");
     triggerErrorAlert();
     return false;
   }
@@ -3114,10 +2990,7 @@ void processSerialInput(String input) {
       Serial.println("[ADMIN REQUIRED]");
       Serial.println("Admin Mode expired before an enrollment ID was entered.");
       Serial.println("Scan the Admin RFID card again.");
-      lcdShowMessage("ADMIN REQUIRED",
-                     "Scan Admin RFID",
-                     "Enrollment Blocked",
-                     "Access Denied");
+      lcdShowMessage("ADMIN REQUIRED", "SCAN ADMIN RFID");
       triggerErrorAlert();
       return;
     }
@@ -3174,10 +3047,7 @@ void processSerialInput(String input) {
         Serial.println("[ADMIN REQUIRED]");
         Serial.println("Enrollment is allowed only in Admin Mode.");
         Serial.println("Scan the Admin RFID card first.");
-        lcdShowMessage("ADMIN REQUIRED",
-                       "Scan Admin RFID",
-                       "Enrollment Blocked",
-                       "Access Denied");
+        lcdShowMessage("ADMIN REQUIRED", "SCAN ADMIN RFID");
         triggerErrorAlert();
         return;
       }
@@ -3185,10 +3055,7 @@ void processSerialInput(String input) {
         Serial.println("[FINGERPRINT ERROR]");
         Serial.println("Cannot enroll. Sensor not detected.");
         Serial.println("Run command F for baud-rate, wiring, and power diagnostics.");
-        lcdShowMessage("FINGER ERROR",
-                       "Sensor Missing",
-                       "Cannot Enroll",
-                       "Press F to Test");
+        lcdShowMessage("FINGER ERROR", "CANNOT ENROLL");
         triggerErrorAlert();
         return;
       }
@@ -3260,10 +3127,8 @@ void processSerialInput(String input) {
       Serial.print("Selected Area: ");
       Serial.println(getAreaName(selectedArea));
       Serial.println("Enter R and scan a permitted fingerprint.");
-      lcdShowMessage("EXIT MODE",
-                     "Area: " + getLCDAreaName(selectedArea),
-                     "Press R to Scan",
-                     "No Presence Needed");
+      lcdShowMessage("EXIT " + getLCDAreaName(selectedArea),
+                     "PRESS R TO SCAN");
       break;
 
     case 'D':
@@ -3573,12 +3438,8 @@ void grantAccess(User* user, Area area, String method) {
   Serial.println();
 
   if (grantedMode == MODE_EXIT) {
-    lcdShowMessage(
-        "EXIT GRANTED",
-        "User: " +
-            (user == nullptr ? String("Authorized User") : user->name),
-        "Area: " + getLCDAreaName(area),
-        "Door Opening");
+    lcdShowMessage("EXIT GRANTED",
+                   user == nullptr ? String("AUTHORIZED USER") : user->name);
   } else {
     lcdShowAccessGranted(user, area);
   }
@@ -3734,10 +3595,7 @@ void testFingerprintAccess() {
       Serial.print(lastDistanceCm, 1);
       Serial.println(" cm");
     }
-    lcdShowMessage("COME CLOSER",
-                   "No Person Near",
-                   "Scan Blocked",
-                   "Door Closed");
+    lcdShowMessage("COME CLOSER", "NO PERSON NEAR");
     return;
   }
 
@@ -3745,10 +3603,7 @@ void testFingerprintAccess() {
     Serial.println("[FINGERPRINT ERROR]");
     Serial.println("Cannot scan. Sensor not detected.");
     Serial.println("Run command F for baud-rate, wiring, and power diagnostics.");
-    lcdShowMessage("FINGER ERROR",
-                   "Sensor Missing",
-                   "Cannot Scan",
-                   "Press F to Test");
+    lcdShowMessage("FINGER ERROR", "CANNOT SCAN");
     triggerErrorAlert();
     returnToEntryMode();
     return;
@@ -3786,9 +3641,8 @@ void testFingerprintAccess() {
   Serial.print("Confidence: ");
   Serial.println(finger.confidence);
   lcdShowMessage("FINGER MATCH",
-                 "ID: " + String(fingerprintID),
-                 "Confidence: " + String(finger.confidence),
-                 "Checking Access");
+                 "ID " + String(fingerprintID) + " C " +
+                     String(finger.confidence));
 
   User* user = findUserByFingerprintID(fingerprintID);
   if (user == nullptr) {
