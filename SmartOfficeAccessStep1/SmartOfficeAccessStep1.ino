@@ -1,5 +1,18 @@
 #include <Adafruit_Fingerprint.h>
 
+// Build modes are compile-time only. The normal firmware target is integrated;
+// pass -DSMART_OFFICE_MODE=STANDALONE_MODE to build the tested local-only path.
+#define STANDALONE_MODE 0
+#define INTEGRATED_MODE 1
+
+#ifndef SMART_OFFICE_MODE
+#define SMART_OFFICE_MODE INTEGRATED_MODE
+#endif
+
+#if SMART_OFFICE_MODE != STANDALONE_MODE && SMART_OFFICE_MODE != INTEGRATED_MODE
+#error "SMART_OFFICE_MODE must be INTEGRATED_MODE or STANDALONE_MODE."
+#endif
+
 // Temporary diagnostic switch:
 //   1 = compile only the exact standalone Fingerprint.ino test below.
 //   0 = compile/run the complete Smart Office Access System.
@@ -113,6 +126,23 @@ void loop() {
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 #include <ESP32Servo.h>
+
+#if SMART_OFFICE_MODE == INTEGRATED_MODE
+#include <ArduinoJson.h>
+#include <HTTPClient.h>
+#include <WiFi.h>
+#include <esp_system.h>
+
+#if __has_include("secrets.h")
+#include "secrets.h"
+#else
+#error "INTEGRATED_MODE requires secrets.h. Copy secrets.example.h to secrets.h and fill the local values."
+#endif
+
+#if !defined(WIFI_SSID) || !defined(WIFI_PASSWORD) || !defined(BACKEND_BASE_URL)
+#error "secrets.h must define WIFI_SSID, WIFI_PASSWORD, and BACKEND_BASE_URL."
+#endif
+#endif
 
 /*
   POWER WARNING:
@@ -324,6 +354,45 @@ unsigned long lastLCDMessageAt = 0;
 String lastLcdLine1 = "";
 String lastLcdLine2 = "";
 
+enum IntegrationSyncState {
+  INTEGRATION_UNSYNCED,
+  INTEGRATION_SYNCED,
+  INTEGRATION_RECONCILIATION_REQUIRED
+};
+
+#if SMART_OFFICE_MODE == INTEGRATED_MODE
+enum WiFiConnectionState {
+  WIFI_CONNECTION_IDLE,
+  WIFI_CONNECTION_CONNECTING,
+  WIFI_CONNECTION_CONNECTED,
+  WIFI_CONNECTION_RETRY_WAIT
+};
+
+constexpr unsigned long WIFI_CONNECTION_ATTEMPT_TIMEOUT_MS = 15000;
+constexpr unsigned long WIFI_RETRY_DELAY_MS = 5000;
+constexpr unsigned long HEARTBEAT_INTERVAL_MS = 2000;
+constexpr unsigned long BACKEND_RETRY_INTERVAL_MS = 5000;
+constexpr unsigned long BACKEND_FAILURE_LOG_INTERVAL_MS = 15000;
+constexpr uint16_t HTTP_CONNECT_TIMEOUT_MS = 1000;
+constexpr uint16_t HTTP_RESPONSE_TIMEOUT_MS = 1500;
+constexpr size_t EXPECTED_BOOTSTRAP_ATTENDANCE_ROWS = USER_COUNT * 7;
+
+IntegrationSyncState integrationSyncState = INTEGRATION_UNSYNCED;
+String bootId;
+String pendingAuthorizationId;
+String lastUnexpectedCommandId;
+WiFiConnectionState wifiConnectionState = WIFI_CONNECTION_IDLE;
+bool wifiWasConnected = false;
+bool backendReachable = false;
+bool backendSystemActive = false;
+bool backendAdminMode = false;
+unsigned long wifiConnectionAttemptStartedAt = 0;
+unsigned long wifiRetryScheduledAt = 0;
+unsigned long lastHeartbeatAttemptAt = 0;
+unsigned long lastBackendSyncAttemptAt = 0;
+unsigned long lastBackendFailureLogAt = 0;
+#endif
+
 void setup();
 void loop();
 void setupFingerprintOnlyDebug();
@@ -347,6 +416,38 @@ bool isStateGuardedDiagnosticCommand(char command);
 void runStateGuardedDiagnostic(char command);
 bool validatePinAssignments();
 void runSoftwareValidation();
+
+void printIntegrationStatus();
+#if SMART_OFFICE_MODE == INTEGRATED_MODE
+void setupNetworkIntegration();
+void serviceNetworkIntegration();
+void startWiFiConnectionAttempt();
+void scheduleWiFiRetry();
+String getWiFiStatusName(wl_status_t status);
+String generateBootId();
+String buildBackendUrl(const char* path);
+bool sendHeartbeat();
+bool fetchBootstrap();
+bool postJson(const char* path,
+              const String& requestBody,
+              String& responseBody,
+              int& responseCode);
+bool getJson(const char* path,
+             String& responseBody,
+             int& responseCode);
+bool applyHeartbeatResponse(const String& responseBody);
+bool applyBootstrapResponse(const String& responseBody);
+bool parseCanonicalSecurity(JsonDocument& document,
+                            int& canonicalFailedAttempts,
+                            bool& canonicalLockdown,
+                            bool& canonicalSystemActive,
+                            bool& canonicalAdminMode);
+void mirrorCanonicalSecurity(int canonicalFailedAttempts,
+                             bool canonicalLockdown);
+void markBackendUnavailable(const String& operation, int responseCode);
+void setIntegrationSyncState(IntegrationSyncState newState);
+String getIntegrationSyncStateName(IntegrationSyncState state);
+#endif
 
 void setupAlertOutputs();
 void triggerAccessDeniedAlert();
@@ -562,12 +663,20 @@ void setup() {
   Serial.println("- Admin RFID required to unlock");
   Serial.println("- Enrollment requires Admin Mode");
   Serial.println("- Anti-passback enabled for all 7 areas");
+#if SMART_OFFICE_MODE == INTEGRATED_MODE
+  Serial.println("- Attendance/security mirrors load from Backend bootstrap");
+  Serial.println("Attendance mirror is UNSYNCED until bootstrap succeeds.");
+#else
   Serial.println("- All users start OUTSIDE after reset");
   Serial.println("Attendance tracking initialized.");
   Serial.println("All users are OUTSIDE.");
+#endif
   Serial.println("Anti-Passback enabled.");
   printAllInsideStatus();
   Serial.println();
+#if SMART_OFFICE_MODE == INTEGRATED_MODE
+  setupNetworkIntegration();
+#endif
   delay(1500);
   lcdShowMenu();
 #endif
@@ -584,6 +693,9 @@ void loop() {
   checkAdminModeTimeout();
   updateDoorState();
   updatePresencePrompt();
+#if SMART_OFFICE_MODE == INTEGRATED_MODE
+  serviceNetworkIntegration();
+#endif
 #endif
 }
 
@@ -756,6 +868,547 @@ void loopServoOnlyDebug() {
   doorServo.write(90);
   delay(1000);
 }
+
+#if SMART_OFFICE_MODE == INTEGRATED_MODE
+String generateBootId() {
+  uint64_t chipValue = ESP.getEfuseMac();
+  uint32_t randomValue = esp_random();
+  char value[40];
+  snprintf(value,
+           sizeof(value),
+           "boot_%08lX%08lX%08lX",
+           static_cast<unsigned long>(chipValue >> 32),
+           static_cast<unsigned long>(chipValue & 0xFFFFFFFFULL),
+           static_cast<unsigned long>(randomValue));
+  return String(value);
+}
+
+String buildBackendUrl(const char* path) {
+  String baseUrl = BACKEND_BASE_URL;
+  while (baseUrl.endsWith("/")) {
+    baseUrl.remove(baseUrl.length() - 1);
+  }
+  return baseUrl + path;
+}
+
+String getIntegrationSyncStateName(IntegrationSyncState state) {
+  switch (state) {
+    case INTEGRATION_SYNCED:
+      return "SYNCED";
+    case INTEGRATION_RECONCILIATION_REQUIRED:
+      return "RECONCILIATION REQUIRED";
+    case INTEGRATION_UNSYNCED:
+    default:
+      return "UNSYNCED";
+  }
+}
+
+void setIntegrationSyncState(IntegrationSyncState newState) {
+  if (integrationSyncState == newState) {
+    return;
+  }
+  integrationSyncState = newState;
+  Serial.print("[BACKEND] State: ");
+  Serial.println(getIntegrationSyncStateName(integrationSyncState));
+}
+
+String getWiFiStatusName(wl_status_t status) {
+  switch (status) {
+    case WL_IDLE_STATUS:
+      return "IDLE";
+    case WL_NO_SSID_AVAIL:
+      return "NO SSID AVAILABLE";
+    case WL_SCAN_COMPLETED:
+      return "SCAN COMPLETED";
+    case WL_CONNECTED:
+      return "CONNECTED";
+    case WL_CONNECT_FAILED:
+      return "CONNECT FAILED";
+    case WL_CONNECTION_LOST:
+      return "CONNECTION LOST";
+    case WL_DISCONNECTED:
+      return "DISCONNECTED";
+    case WL_NO_SHIELD:
+      return "NO WIFI SHIELD";
+    default:
+      return "UNKNOWN";
+  }
+}
+
+void startWiFiConnectionAttempt() {
+  if (wifiConnectionState == WIFI_CONNECTION_CONNECTING) {
+    return;
+  }
+
+  wifiConnectionAttemptStartedAt = millis();
+  wifiConnectionState = WIFI_CONNECTION_CONNECTING;
+  Serial.print("[WIFI] Starting connection to ");
+  Serial.println(WIFI_SSID);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+}
+
+void scheduleWiFiRetry() {
+  wifiConnectionState = WIFI_CONNECTION_RETRY_WAIT;
+  wifiRetryScheduledAt = millis();
+  Serial.println("[WIFI] Retry scheduled");
+}
+
+void setupNetworkIntegration() {
+  bootId = generateBootId();
+  integrationSyncState = INTEGRATION_UNSYNCED;
+  backendReachable = false;
+  pendingAuthorizationId = "";
+  wifiConnectionState = WIFI_CONNECTION_IDLE;
+
+  Serial.println("[INTEGRATION] Mode: INTEGRATED");
+  Serial.print("[INTEGRATION] Boot ID: ");
+  Serial.println(bootId);
+  Serial.print("[BACKEND] Configured URL: ");
+  Serial.println(BACKEND_BASE_URL);
+
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(false);
+  startWiFiConnectionAttempt();
+}
+
+void serviceNetworkIntegration() {
+  unsigned long now = millis();
+  wl_status_t wifiStatus = WiFi.status();
+  bool wifiConnected = wifiStatus == WL_CONNECTED;
+
+  if (!wifiConnected) {
+    if (wifiConnectionState == WIFI_CONNECTION_CONNECTED ||
+        wifiWasConnected) {
+      Serial.println("[WIFI] Disconnected");
+      wifiWasConnected = false;
+      backendReachable = false;
+      setIntegrationSyncState(INTEGRATION_UNSYNCED);
+      WiFi.disconnect(false, false);
+      scheduleWiFiRetry();
+      return;
+    }
+
+    if (wifiConnectionState == WIFI_CONNECTION_CONNECTING) {
+      if (now - wifiConnectionAttemptStartedAt >=
+          WIFI_CONNECTION_ATTEMPT_TIMEOUT_MS) {
+        Serial.println("[WIFI] Connection attempt timed out");
+        Serial.print("[WIFI] Status: ");
+        Serial.print(static_cast<int>(wifiStatus));
+        Serial.print(" (");
+        Serial.print(getWiFiStatusName(wifiStatus));
+        Serial.println(')');
+        WiFi.disconnect(false, false);
+        scheduleWiFiRetry();
+      }
+      return;
+    }
+
+    if (wifiConnectionState == WIFI_CONNECTION_RETRY_WAIT) {
+      if (now - wifiRetryScheduledAt >= WIFI_RETRY_DELAY_MS) {
+        startWiFiConnectionAttempt();
+      }
+      return;
+    }
+
+    if (wifiConnectionState == WIFI_CONNECTION_IDLE) {
+      startWiFiConnectionAttempt();
+    }
+    return;
+  }
+
+  if (wifiConnectionState != WIFI_CONNECTION_CONNECTED ||
+      !wifiWasConnected) {
+    wifiConnectionState = WIFI_CONNECTION_CONNECTED;
+    wifiWasConnected = true;
+    backendReachable = false;
+    lastBackendSyncAttemptAt = 0;
+    lastHeartbeatAttemptAt = 0;
+    Serial.println("[WIFI] Connected");
+    Serial.print("[WIFI] IP: ");
+    Serial.println(WiFi.localIP());
+    Serial.print("[WIFI] RSSI: ");
+    Serial.print(WiFi.RSSI());
+    Serial.println(" dBm");
+    Serial.println("[BACKEND] Synchronizing...");
+  }
+
+  if (integrationSyncState == INTEGRATION_UNSYNCED) {
+    if (lastBackendSyncAttemptAt == 0 ||
+        now - lastBackendSyncAttemptAt >= BACKEND_RETRY_INTERVAL_MS) {
+      fetchBootstrap();
+    }
+    return;
+  }
+
+  if (integrationSyncState == INTEGRATION_RECONCILIATION_REQUIRED &&
+      (lastBackendSyncAttemptAt == 0 ||
+       now - lastBackendSyncAttemptAt >= BACKEND_RETRY_INTERVAL_MS)) {
+    // Keep reporting physical state while periodically checking whether an
+    // operator/later phase has resolved the durable pending authorization.
+    if (!fetchBootstrap()) {
+      return;
+    }
+  }
+
+  if (lastHeartbeatAttemptAt == 0 ||
+      now - lastHeartbeatAttemptAt >= HEARTBEAT_INTERVAL_MS) {
+    sendHeartbeat();
+  }
+}
+
+bool postJson(const char* path,
+              const String& requestBody,
+              String& responseBody,
+              int& responseCode) {
+  responseBody = "";
+  responseCode = -1;
+  if (WiFi.status() != WL_CONNECTED) {
+    return false;
+  }
+
+  WiFiClient client;
+  HTTPClient http;
+  http.setConnectTimeout(HTTP_CONNECT_TIMEOUT_MS);
+  http.setTimeout(HTTP_RESPONSE_TIMEOUT_MS);
+  http.setReuse(false);
+  if (!http.begin(client, buildBackendUrl(path))) {
+    return false;
+  }
+
+  http.addHeader("Content-Type", "application/json");
+  responseCode = http.POST(requestBody);
+  if (responseCode > 0) {
+    responseBody = http.getString();
+  }
+  http.end();
+  return responseCode == HTTP_CODE_OK;
+}
+
+bool getJson(const char* path,
+             String& responseBody,
+             int& responseCode) {
+  responseBody = "";
+  responseCode = -1;
+  if (WiFi.status() != WL_CONNECTED) {
+    return false;
+  }
+
+  WiFiClient client;
+  HTTPClient http;
+  http.setConnectTimeout(HTTP_CONNECT_TIMEOUT_MS);
+  http.setTimeout(HTTP_RESPONSE_TIMEOUT_MS);
+  http.setReuse(false);
+  if (!http.begin(client, buildBackendUrl(path))) {
+    return false;
+  }
+
+  responseCode = http.GET();
+  if (responseCode > 0) {
+    responseBody = http.getString();
+  }
+  http.end();
+  return responseCode == HTTP_CODE_OK;
+}
+
+bool parseCanonicalSecurity(JsonDocument& document,
+                            int& canonicalFailedAttempts,
+                            bool& canonicalLockdown,
+                            bool& canonicalSystemActive,
+                            bool& canonicalAdminMode) {
+  if (!document["failed_attempts"].is<int>() ||
+      !document["lockdown_active"].is<bool>() ||
+      !document["system_active"].is<bool>() ||
+      !document["admin_mode"].is<bool>()) {
+    return false;
+  }
+
+  canonicalFailedAttempts = document["failed_attempts"].as<int>();
+  canonicalLockdown = document["lockdown_active"].as<bool>();
+  canonicalSystemActive = document["system_active"].as<bool>();
+  canonicalAdminMode = document["admin_mode"].as<bool>();
+  return canonicalFailedAttempts >= 0 &&
+         canonicalFailedAttempts <= MAX_FAILED_ATTEMPTS;
+}
+
+void mirrorCanonicalSecurity(int canonicalFailedAttempts,
+                             bool canonicalLockdown) {
+  if (canonicalLockdown && !systemLocked) {
+    // Mirror canonical Lockdown without alerts, servo movement, or Backend writes.
+    applyLockedState();
+  } else if (!canonicalLockdown && systemLocked) {
+    systemLocked = false;
+  }
+  failedAttempts = canonicalFailedAttempts;
+}
+
+void markBackendUnavailable(const String& operation, int responseCode) {
+  unsigned long now = millis();
+  bool shouldLog = backendReachable || lastBackendFailureLogAt == 0 ||
+                   now - lastBackendFailureLogAt >=
+                       BACKEND_FAILURE_LOG_INTERVAL_MS;
+  backendReachable = false;
+  setIntegrationSyncState(INTEGRATION_UNSYNCED);
+
+  if (shouldLog) {
+    Serial.print("[BACKEND] ");
+    Serial.print(operation);
+    Serial.print(" failed");
+    if (responseCode != -1) {
+      Serial.print(" (HTTP/code ");
+      Serial.print(responseCode);
+      Serial.print(')');
+    }
+    Serial.println("; local hardware loop continues.");
+    lastBackendFailureLogAt = now;
+  }
+}
+
+bool applyHeartbeatResponse(const String& responseBody) {
+  JsonDocument document;
+  DeserializationError jsonError = deserializeJson(document, responseBody);
+  if (jsonError) {
+    Serial.print("[BACKEND] Invalid heartbeat JSON: ");
+    Serial.println(jsonError.c_str());
+    return false;
+  }
+
+  int canonicalFailedAttempts = 0;
+  bool canonicalLockdown = false;
+  bool canonicalSystemActive = false;
+  bool canonicalAdminMode = false;
+  if (!parseCanonicalSecurity(document,
+                              canonicalFailedAttempts,
+                              canonicalLockdown,
+                              canonicalSystemActive,
+                              canonicalAdminMode)) {
+    Serial.println("[BACKEND] Heartbeat response is missing canonical state.");
+    return false;
+  }
+
+  JsonVariant pendingRequest = document["pending_request_id"];
+  JsonVariant command = document["command"];
+  if ((!pendingRequest.isNull() && !pendingRequest.is<const char*>()) ||
+      (!command.isNull() && !command.is<JsonObject>())) {
+    Serial.println("[BACKEND] Heartbeat nullable fields are invalid.");
+    return false;
+  }
+
+  mirrorCanonicalSecurity(canonicalFailedAttempts, canonicalLockdown);
+  backendSystemActive = canonicalSystemActive;
+  backendAdminMode = canonicalAdminMode;
+
+  if (!pendingRequest.isNull()) {
+    String receivedPendingId = pendingRequest.as<const char*>();
+    if (receivedPendingId != pendingAuthorizationId) {
+      Serial.print("[BACKEND] Pending authorization requires reconciliation: ");
+      Serial.println(receivedPendingId);
+    }
+    pendingAuthorizationId = receivedPendingId;
+    setIntegrationSyncState(INTEGRATION_RECONCILIATION_REQUIRED);
+  }
+
+  if (!command.isNull()) {
+    const char* receivedRequestId = command["request_id"] | "unknown";
+    String commandId = receivedRequestId;
+    if (commandId != lastUnexpectedCommandId) {
+      Serial.print("[BACKEND] Access command ignored in Phase 4: ");
+      Serial.println(commandId);
+      Serial.println("[BACKEND] No acknowledgement, fingerprint scan, or servo movement performed.");
+      lastUnexpectedCommandId = commandId;
+    }
+  } else {
+    lastUnexpectedCommandId = "";
+  }
+  return true;
+}
+
+bool sendHeartbeat() {
+  lastHeartbeatAttemptAt = millis();
+  updateUltrasonicMeasurement(false);
+
+  bool measurementValid = isUltrasonicMeasurementValid(lastDistanceCm);
+  JsonDocument request;
+  request["boot_id"] = bootId;
+  request["door_state"] = doorOpen ? "OPEN" : "CLOSED";
+  if (measurementValid) {
+    request["person_detected"] = isDistanceNear(lastDistanceCm);
+    request["distance_cm"] = lastDistanceCm;
+  } else {
+    request["person_detected"] = nullptr;
+    request["distance_cm"] = nullptr;
+  }
+  request["fingerprint_ready"] = fingerprintReady;
+  request["admin_mode"] = adminMode;
+  request["active_request_id"] = nullptr;
+
+  String requestBody;
+  requestBody.reserve(256);
+  serializeJson(request, requestBody);
+
+  String responseBody;
+  int responseCode = -1;
+  if (!postJson("/api/esp32/heartbeat",
+                requestBody,
+                responseBody,
+                responseCode) ||
+      !applyHeartbeatResponse(responseBody)) {
+    markBackendUnavailable("Heartbeat", responseCode);
+    return false;
+  }
+
+  if (!backendReachable) {
+    Serial.println("[BACKEND] Heartbeat restored");
+  }
+  backendReachable = true;
+  return true;
+}
+
+bool applyBootstrapResponse(const String& responseBody) {
+  JsonDocument document;
+  DeserializationError jsonError = deserializeJson(document, responseBody);
+  if (jsonError) {
+    Serial.print("[BACKEND] Invalid bootstrap JSON: ");
+    Serial.println(jsonError.c_str());
+    return false;
+  }
+
+  int canonicalFailedAttempts = 0;
+  bool canonicalLockdown = false;
+  bool canonicalSystemActive = false;
+  bool canonicalAdminMode = false;
+  if (!parseCanonicalSecurity(document,
+                              canonicalFailedAttempts,
+                              canonicalLockdown,
+                              canonicalSystemActive,
+                              canonicalAdminMode)) {
+    Serial.println("[BACKEND] Bootstrap is missing canonical security state.");
+    return false;
+  }
+
+  JsonArray attendance = document["attendance"].as<JsonArray>();
+  if (attendance.isNull() ||
+      attendance.size() != EXPECTED_BOOTSTRAP_ATTENDANCE_ROWS) {
+    Serial.print("[BACKEND] Bootstrap attendance row count invalid: ");
+    Serial.println(attendance.isNull() ? 0 : attendance.size());
+    return false;
+  }
+
+  uint16_t rebuiltInsideMasks[USER_COUNT] = {};
+  bool seenAttendance[USER_COUNT][7] = {};
+  for (JsonObject row : attendance) {
+    if (!row["user_id"].is<int>() || !row["area_id"].is<int>() ||
+        !row["is_inside"].is<bool>()) {
+      Serial.println("[BACKEND] Bootstrap attendance row has invalid fields.");
+      return false;
+    }
+
+    int userId = row["user_id"].as<int>();
+    int areaId = row["area_id"].as<int>();
+    int userIndex = -1;
+    for (size_t i = 0; i < USER_COUNT; ++i) {
+      if (users[i].fingerprintID == userId) {
+        userIndex = static_cast<int>(i);
+        break;
+      }
+    }
+
+    if (userIndex < 0 || areaId < 1 || areaId > 7 ||
+        seenAttendance[userIndex][areaId - 1]) {
+      Serial.println("[BACKEND] Bootstrap attendance mapping is invalid or duplicated.");
+      return false;
+    }
+
+    seenAttendance[userIndex][areaId - 1] = true;
+    if (row["is_inside"].as<bool>()) {
+      rebuiltInsideMasks[userIndex] |=
+          static_cast<uint16_t>(1U << (areaId - 1));
+    }
+  }
+
+  for (size_t userIndex = 0; userIndex < USER_COUNT; ++userIndex) {
+    for (size_t areaIndex = 0; areaIndex < 7; ++areaIndex) {
+      if (!seenAttendance[userIndex][areaIndex]) {
+        Serial.println("[BACKEND] Bootstrap attendance matrix is incomplete.");
+        return false;
+      }
+    }
+  }
+
+  JsonVariant pending = document["pending_authorization"];
+  bool hasPendingAuthorization = !pending.isNull();
+  String receivedPendingId;
+  int pendingUserId = 0;
+  int pendingAreaId = 0;
+  String pendingDirection;
+  if (hasPendingAuthorization) {
+    if (!pending.is<JsonObject>() || !pending["request_id"].is<const char*>() ||
+        !pending["user_id"].is<int>() || !pending["area_id"].is<int>() ||
+        !pending["direction"].is<const char*>() ||
+        !pending["created_at"].is<const char*>() ||
+        !pending["authorized_at"].is<const char*>() ||
+        !pending["expires_at"].is<const char*>()) {
+      Serial.println("[BACKEND] Pending authorization payload is invalid.");
+      return false;
+    }
+    receivedPendingId = pending["request_id"].as<const char*>();
+    pendingUserId = pending["user_id"].as<int>();
+    pendingAreaId = pending["area_id"].as<int>();
+    pendingDirection = pending["direction"].as<const char*>();
+    if (receivedPendingId.length() == 0 || pendingUserId < 1 ||
+        pendingUserId > static_cast<int>(USER_COUNT) || pendingAreaId < 1 ||
+        pendingAreaId > 7 ||
+        (pendingDirection != "ENTRY" && pendingDirection != "EXIT")) {
+      Serial.println("[BACKEND] Pending authorization values are out of range.");
+      return false;
+    }
+  }
+
+  // Commit mirrors only after the complete 6 x 7 matrix and pending payload
+  // have passed validation. A partial response can never erase attendance.
+  for (size_t i = 0; i < USER_COUNT; ++i) {
+    users[i].insideMask = rebuiltInsideMasks[i];
+  }
+  mirrorCanonicalSecurity(canonicalFailedAttempts, canonicalLockdown);
+  backendSystemActive = canonicalSystemActive;
+  backendAdminMode = canonicalAdminMode;
+  backendReachable = true;
+
+  if (hasPendingAuthorization) {
+    pendingAuthorizationId = receivedPendingId;
+    setIntegrationSyncState(INTEGRATION_RECONCILIATION_REQUIRED);
+    Serial.println("[BACKEND] Bootstrap found a persistent pending authorization.");
+    Serial.print("[BACKEND] Request/User/Area/Direction: ");
+    Serial.print(receivedPendingId);
+    Serial.print(" / ");
+    Serial.print(pendingUserId);
+    Serial.print(" / ");
+    Serial.print(pendingAreaId);
+    Serial.print(" / ");
+    Serial.println(pendingDirection);
+    Serial.println("[BACKEND] Door remains unchanged; manual/NVS reconciliation is required.");
+  } else {
+    pendingAuthorizationId = "";
+    setIntegrationSyncState(INTEGRATION_SYNCED);
+    Serial.println("[BACKEND] Bootstrap succeeded: 42 attendance mirrors loaded.");
+  }
+  return true;
+}
+
+bool fetchBootstrap() {
+  lastBackendSyncAttemptAt = millis();
+  String responseBody;
+  int responseCode = -1;
+  if (!getJson("/api/esp32/bootstrap", responseBody, responseCode) ||
+      !applyBootstrapResponse(responseBody)) {
+    markBackendUnavailable("Bootstrap", responseCode);
+    return false;
+  }
+
+  lastHeartbeatAttemptAt = 0;
+  return true;
+}
+#endif
 
 void setupAlertOutputs() {
   pinMode(RED_LED_PIN, OUTPUT);
@@ -2771,9 +3424,38 @@ void runSoftwareValidation() {
   Serial.println();
 }
 
+void printIntegrationStatus() {
+#if SMART_OFFICE_MODE == INTEGRATED_MODE
+  Serial.println("Integration Mode: INTEGRATED");
+  Serial.print("Wi-Fi: ");
+  Serial.println(WiFi.status() == WL_CONNECTED ? "CONNECTED" : "DISCONNECTED");
+  Serial.print("Backend: ");
+  Serial.println(getIntegrationSyncStateName(integrationSyncState));
+  Serial.print("Backend Reachable: ");
+  Serial.println(backendReachable ? "YES" : "NO");
+  Serial.print("Backend System Active: ");
+  Serial.println(backendSystemActive ? "YES" : "NO");
+  Serial.print("Backend Admin Mirror: ");
+  Serial.println(backendAdminMode ? "ON" : "OFF");
+  Serial.print("Boot ID: ");
+  Serial.println(bootId);
+  Serial.print("Pending Authorization: ");
+  Serial.println(pendingAuthorizationId.length() > 0
+                     ? pendingAuthorizationId
+                     : String("NONE"));
+#else
+  Serial.println("Integration Mode: STANDALONE");
+  Serial.println("Wi-Fi: DISABLED");
+  Serial.println("Backend: DISABLED");
+  Serial.println("Boot ID: NOT USED");
+#endif
+}
+
 void printSystemStatus() {
   Serial.println();
   Serial.println("[SYSTEM STATUS]");
+  printIntegrationStatus();
+  Serial.println();
   Serial.print("Selected Area: ");
   Serial.println(getAreaName(selectedArea));
   Serial.print("Current Mode: ");
