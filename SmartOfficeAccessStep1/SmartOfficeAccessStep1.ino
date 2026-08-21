@@ -376,6 +376,24 @@ enum RemoteCommandDecision {
   REMOTE_COMMAND_REJECT_CONFLICT
 };
 
+enum RemoteFingerprintWorkflowState {
+  REMOTE_FINGERPRINT_PRECHECK,
+  REMOTE_FINGERPRINT_WAITING_FOR_FINGER,
+  REMOTE_FINGERPRINT_CONVERTING_IMAGE,
+  REMOTE_FINGERPRINT_SEARCHING,
+  REMOTE_ACCESS_CHECK_READY,
+  REMOTE_ACCESS_CHECK_STATUS,
+  REMOTE_AUTHORIZED_WAITING_DOOR
+};
+
+enum RemoteFingerprintSensorOutcome {
+  REMOTE_SENSOR_KEEP_WAITING,
+  REMOTE_SENSOR_IMAGE_READY,
+  REMOTE_SENSOR_MATCH,
+  REMOTE_SENSOR_NOT_RECOGNIZED,
+  REMOTE_SENSOR_READ_ERROR
+};
+
 struct RemoteAccessRequestState {
   bool active;
   String requestId;
@@ -384,12 +402,26 @@ struct RemoteAccessRequestState {
   bool createdBySerial;
   String expiresAt;
   unsigned long receivedAt;
+  RemoteFingerprintWorkflowState workflowState;
+  unsigned long scanStartedAt;
+  bool precheckDoorOpen;
+  bool precheckPersonKnown;
+  bool precheckPersonDetected;
+  bool precheckDistanceKnown;
+  float precheckDistanceCm;
+  bool precheckFingerprintReady;
+  String fingerprintResult;
+  int fingerprintId;
+  int fingerprintConfidence;
+  String accessCheckPayload;
+  unsigned long lastAccessCheckAttemptAt;
 };
 
 constexpr unsigned long WIFI_CONNECTION_ATTEMPT_TIMEOUT_MS = 15000;
 constexpr unsigned long WIFI_RETRY_DELAY_MS = 5000;
 constexpr unsigned long HEARTBEAT_INTERVAL_MS = 2000;
 constexpr unsigned long REMOTE_REQUEST_STATUS_INTERVAL_MS = 2000;
+constexpr unsigned long ACCESS_CHECK_RETRY_INTERVAL_MS = 2000;
 constexpr unsigned long BACKEND_RETRY_INTERVAL_MS = 5000;
 constexpr unsigned long BACKEND_FAILURE_LOG_INTERVAL_MS = 15000;
 constexpr uint16_t HTTP_CONNECT_TIMEOUT_MS = 1000;
@@ -468,6 +500,25 @@ RemoteCommandDecision evaluateRemoteCommand(
     int areaId,
     AccessMode direction);
 void handleRemoteCommand(JsonObject command);
+void resetRemoteAccessRequestState();
+void serviceRemoteFingerprintWorkflow();
+bool shouldStartRemoteFingerprintScan(AccessMode direction,
+                                      bool locked,
+                                      bool isDoorOpen,
+                                      bool fingerprintAvailable,
+                                      bool personKnown,
+                                      bool personDetected);
+RemoteFingerprintSensorOutcome classifyRemoteFingerprintImageResult(
+    uint8_t result);
+RemoteFingerprintSensorOutcome classifyRemoteFingerprintSearchResult(
+    uint8_t result);
+bool isRemoteFingerprintSensorStep(RemoteFingerprintWorkflowState state);
+void prepareRemoteAccessCheckPayload(const String& fingerprintResult,
+                                     int fingerprintId = -1,
+                                     int confidence = -1);
+bool handleRemoteAccessCheckResponse(const String& responseBody);
+String getRemoteFingerprintWorkflowName(
+    RemoteFingerprintWorkflowState state);
 void serviceRemoteRequestStatus();
 void clearTrackedRemoteRequest(const String& requestId,
                                const String& terminalState);
@@ -996,13 +1047,7 @@ void setupNetworkIntegration() {
   backendReachable = false;
   pendingAuthorizationId = "";
   wifiConnectionState = WIFI_CONNECTION_IDLE;
-  remoteAccessRequest.active = false;
-  remoteAccessRequest.requestId = "";
-  remoteAccessRequest.area = AREA_NONE;
-  remoteAccessRequest.direction = MODE_ENTRY;
-  remoteAccessRequest.createdBySerial = false;
-  remoteAccessRequest.expiresAt = "";
-  remoteAccessRequest.receivedAt = 0;
+  resetRemoteAccessRequestState();
   serialCreatedRequestId = "";
   serialCreatedRequestArea = AREA_NONE;
   serialCreatedRequestDirection = MODE_ENTRY;
@@ -1104,6 +1149,7 @@ void serviceNetworkIntegration() {
     sendHeartbeat();
   }
   serviceRemoteRequestStatus();
+  serviceRemoteFingerprintWorkflow();
 }
 
 bool postJson(const char* path,
@@ -1159,6 +1205,29 @@ bool getJson(const char* path,
   }
   http.end();
   return responseCode == HTTP_CODE_OK;
+}
+
+void resetRemoteAccessRequestState() {
+  remoteAccessRequest.active = false;
+  remoteAccessRequest.requestId = "";
+  remoteAccessRequest.area = AREA_NONE;
+  remoteAccessRequest.direction = MODE_ENTRY;
+  remoteAccessRequest.createdBySerial = false;
+  remoteAccessRequest.expiresAt = "";
+  remoteAccessRequest.receivedAt = 0;
+  remoteAccessRequest.workflowState = REMOTE_FINGERPRINT_PRECHECK;
+  remoteAccessRequest.scanStartedAt = 0;
+  remoteAccessRequest.precheckDoorOpen = false;
+  remoteAccessRequest.precheckPersonKnown = false;
+  remoteAccessRequest.precheckPersonDetected = false;
+  remoteAccessRequest.precheckDistanceKnown = false;
+  remoteAccessRequest.precheckDistanceCm = -1.0;
+  remoteAccessRequest.precheckFingerprintReady = false;
+  remoteAccessRequest.fingerprintResult = "";
+  remoteAccessRequest.fingerprintId = -1;
+  remoteAccessRequest.fingerprintConfidence = -1;
+  remoteAccessRequest.accessCheckPayload = "";
+  remoteAccessRequest.lastAccessCheckAttemptAt = 0;
 }
 
 bool parseRemoteDirection(const String& value, AccessMode& direction) {
@@ -1267,6 +1336,19 @@ void handleRemoteCommand(JsonObject command) {
       serialCreatedRequestId == requestId;
   remoteAccessRequest.expiresAt = expiresAt;
   remoteAccessRequest.receivedAt = millis();
+  remoteAccessRequest.workflowState = REMOTE_FINGERPRINT_PRECHECK;
+  remoteAccessRequest.scanStartedAt = 0;
+  remoteAccessRequest.precheckDoorOpen = false;
+  remoteAccessRequest.precheckPersonKnown = false;
+  remoteAccessRequest.precheckPersonDetected = false;
+  remoteAccessRequest.precheckDistanceKnown = false;
+  remoteAccessRequest.precheckDistanceCm = -1.0;
+  remoteAccessRequest.precheckFingerprintReady = false;
+  remoteAccessRequest.fingerprintResult = "";
+  remoteAccessRequest.fingerprintId = -1;
+  remoteAccessRequest.fingerprintConfidence = -1;
+  remoteAccessRequest.accessCheckPayload = "";
+  remoteAccessRequest.lastAccessCheckAttemptAt = 0;
   if (remoteAccessRequest.createdBySerial) {
     serialCreatedRequestId = "";
     serialCreatedRequestArea = AREA_NONE;
@@ -1285,9 +1367,375 @@ void handleRemoteCommand(JsonObject command) {
   Serial.println(getAreaName(remoteAccessRequest.area));
   Serial.print("[ACCESS] Direction: ");
   Serial.println(getAccessModeName(remoteAccessRequest.direction));
-  Serial.println("[ACCESS] Waiting for Phase 6 fingerprint processing");
-  Serial.println("[ACCESS] No fingerprint scan or servo action in Phase 5.");
+  Serial.println("[ACCESS] Starting Phase 6 physical precheck");
+  Serial.println("[ACCESS] Door control remains disabled until Phase 7.");
   Serial.println();
+}
+
+bool shouldStartRemoteFingerprintScan(AccessMode direction,
+                                      bool locked,
+                                      bool isDoorOpen,
+                                      bool fingerprintAvailable,
+                                      bool personKnown,
+                                      bool personDetected) {
+  if (locked || isDoorOpen || !fingerprintAvailable) {
+    return false;
+  }
+  return direction == MODE_EXIT || (personKnown && personDetected);
+}
+
+RemoteFingerprintSensorOutcome classifyRemoteFingerprintImageResult(
+    uint8_t result) {
+  if (result == FINGERPRINT_NOFINGER) {
+    return REMOTE_SENSOR_KEEP_WAITING;
+  }
+  if (result == FINGERPRINT_OK) {
+    return REMOTE_SENSOR_IMAGE_READY;
+  }
+  return REMOTE_SENSOR_READ_ERROR;
+}
+
+RemoteFingerprintSensorOutcome classifyRemoteFingerprintSearchResult(
+    uint8_t result) {
+  if (result == FINGERPRINT_OK) {
+    return REMOTE_SENSOR_MATCH;
+  }
+  if (result == FINGERPRINT_NOTFOUND) {
+    return REMOTE_SENSOR_NOT_RECOGNIZED;
+  }
+  return REMOTE_SENSOR_READ_ERROR;
+}
+
+bool isRemoteFingerprintSensorStep(RemoteFingerprintWorkflowState state) {
+  return state == REMOTE_FINGERPRINT_WAITING_FOR_FINGER ||
+         state == REMOTE_FINGERPRINT_CONVERTING_IMAGE ||
+         state == REMOTE_FINGERPRINT_SEARCHING;
+}
+
+String getRemoteFingerprintWorkflowName(
+    RemoteFingerprintWorkflowState state) {
+  switch (state) {
+    case REMOTE_FINGERPRINT_PRECHECK:
+      return "PHYSICAL_PRECHECK";
+    case REMOTE_FINGERPRINT_WAITING_FOR_FINGER:
+      return "WAITING_FOR_FINGERPRINT";
+    case REMOTE_FINGERPRINT_CONVERTING_IMAGE:
+      return "PROCESSING_FINGERPRINT";
+    case REMOTE_FINGERPRINT_SEARCHING:
+      return "MATCHING_FINGERPRINT";
+    case REMOTE_ACCESS_CHECK_READY:
+      return "SENDING_ACCESS_CHECK";
+    case REMOTE_ACCESS_CHECK_STATUS:
+      return "CHECKING_REQUEST_STATUS";
+    case REMOTE_AUTHORIZED_WAITING_DOOR:
+      return "AUTHORIZED_WAITING_FOR_PHASE7_DOOR";
+    default:
+      return "UNKNOWN";
+  }
+}
+
+void prepareRemoteAccessCheckPayload(const String& capturedResult,
+                                     int fingerprintId,
+                                     int confidence) {
+  if (!remoteAccessRequest.active ||
+      remoteAccessRequest.accessCheckPayload.length() > 0) {
+    return;
+  }
+
+  String finalResult = capturedResult;
+  if (finalResult == "MATCH" &&
+      (fingerprintId < 0 || confidence < 0)) {
+    finalResult = "READ_ERROR";
+    fingerprintId = -1;
+    confidence = -1;
+  }
+
+  remoteAccessRequest.fingerprintResult = finalResult;
+  remoteAccessRequest.fingerprintId =
+      finalResult == "MATCH" ? fingerprintId : -1;
+  remoteAccessRequest.fingerprintConfidence =
+      finalResult == "MATCH" ? confidence : -1;
+
+  JsonDocument payload;
+  payload["request_id"] = remoteAccessRequest.requestId;
+  JsonObject precheck = payload["precheck"].to<JsonObject>();
+  precheck["door_state"] =
+      remoteAccessRequest.precheckDoorOpen ? "OPEN" : "CLOSED";
+  if (remoteAccessRequest.precheckPersonKnown) {
+    precheck["person_detected"] =
+        remoteAccessRequest.precheckPersonDetected;
+  } else {
+    precheck["person_detected"] = nullptr;
+  }
+  if (remoteAccessRequest.precheckDistanceKnown) {
+    precheck["distance_cm"] = remoteAccessRequest.precheckDistanceCm;
+  } else {
+    precheck["distance_cm"] = nullptr;
+  }
+  precheck["fingerprint_ready"] =
+      remoteAccessRequest.precheckFingerprintReady;
+  payload["fingerprint_result"] = finalResult;
+  if (finalResult == "MATCH") {
+    payload["fingerprint_id"] = fingerprintId;
+    payload["confidence"] = confidence;
+  }
+
+  serializeJson(payload, remoteAccessRequest.accessCheckPayload);
+  remoteAccessRequest.workflowState = REMOTE_ACCESS_CHECK_READY;
+  remoteAccessRequest.lastAccessCheckAttemptAt = 0;
+
+  Serial.print("[FINGERPRINT] Result captured: ");
+  Serial.println(finalResult);
+  if (finalResult == "MATCH") {
+    Serial.print("[FINGERPRINT] ID / confidence: ");
+    Serial.print(fingerprintId);
+    Serial.print(" / ");
+    Serial.println(confidence);
+  }
+  Serial.println("[ACCESS CHECK] Exact payload retained until Backend response.");
+}
+
+bool handleRemoteAccessCheckResponse(const String& responseBody) {
+  JsonDocument response;
+  DeserializationError jsonError = deserializeJson(response, responseBody);
+  bool valid = !jsonError &&
+               response["request_id"].is<const char*>() &&
+               response["status"].is<const char*>() &&
+               response["reason_code"].is<const char*>() &&
+               response["message"].is<const char*>() &&
+               response["failed_attempts"].is<int>() &&
+               response["lockdown_active"].is<bool>();
+  if (!valid) {
+    Serial.println("[ACCESS CHECK] Invalid response ignored; exact payload retained.");
+    return false;
+  }
+
+  String responseRequestId = response["request_id"].as<const char*>();
+  String status = response["status"].as<const char*>();
+  String reasonCode = response["reason_code"].as<const char*>();
+  String message = response["message"].as<const char*>();
+  int canonicalFailedAttempts = response["failed_attempts"].as<int>();
+  bool canonicalLockdown = response["lockdown_active"].as<bool>();
+  if (responseRequestId != remoteAccessRequest.requestId ||
+      canonicalFailedAttempts < 0 ||
+      canonicalFailedAttempts > MAX_FAILED_ATTEMPTS) {
+    Serial.println("[ACCESS CHECK] Mismatched response ignored; exact payload retained.");
+    return false;
+  }
+
+  if (status != "DENIED" && status != "AUTHORIZED_WAITING_DOOR") {
+    Serial.print("[ACCESS CHECK] Unexpected status ignored: ");
+    Serial.println(status);
+    return false;
+  }
+
+  mirrorCanonicalSecurity(canonicalFailedAttempts, canonicalLockdown);
+  Serial.println();
+  Serial.println("[ACCESS CHECK RESPONSE]");
+  Serial.print("Request: ");
+  Serial.println(responseRequestId);
+  Serial.print("Status: ");
+  Serial.println(status);
+  Serial.print("Reason: ");
+  Serial.print(reasonCode);
+  Serial.print(" - ");
+  Serial.println(message);
+  Serial.print("Failed Attempts: ");
+  Serial.print(failedAttempts);
+  Serial.print('/');
+  Serial.println(MAX_FAILED_ATTEMPTS);
+
+  if (status == "DENIED") {
+    lcdShowMessage("ACCESS DENIED", reasonCode);
+    clearTrackedRemoteRequest(responseRequestId, "DENIED");
+    return true;
+  }
+
+  pendingAuthorizationId = responseRequestId;
+  remoteAccessRequest.workflowState = REMOTE_AUTHORIZED_WAITING_DOOR;
+  setIntegrationSyncState(INTEGRATION_RECONCILIATION_REQUIRED);
+  lcdShowMessage("AUTHORIZED", "WAIT FOR DOOR");
+  Serial.println("Door remains CLOSED. Phase 7 completion is not implemented.");
+  Serial.println();
+  return true;
+}
+
+void serviceRemoteFingerprintWorkflow() {
+  if (!remoteAccessRequest.active ||
+      remoteAccessRequest.workflowState ==
+          REMOTE_AUTHORIZED_WAITING_DOOR) {
+    return;
+  }
+
+  RemoteFingerprintWorkflowState state =
+      remoteAccessRequest.workflowState;
+  if (state == REMOTE_FINGERPRINT_PRECHECK) {
+    if (integrationSyncState != INTEGRATION_SYNCED ||
+        !backendReachable || WiFi.status() != WL_CONNECTED) {
+      return;
+    }
+
+    remoteAccessRequest.precheckDoorOpen = doorOpen;
+    remoteAccessRequest.precheckFingerprintReady = fingerprintReady;
+    remoteAccessRequest.precheckPersonKnown = false;
+    remoteAccessRequest.precheckPersonDetected = false;
+    remoteAccessRequest.precheckDistanceKnown = false;
+    remoteAccessRequest.precheckDistanceCm = -1.0;
+
+    if (remoteAccessRequest.direction == MODE_ENTRY) {
+      // ENTRY uses a new physical reading immediately before the scan. EXIT
+      // deliberately skips this requirement.
+      updateUltrasonicMeasurement(true);
+      bool measurementValid =
+          isUltrasonicMeasurementValid(lastDistanceCm);
+      remoteAccessRequest.precheckPersonKnown = measurementValid;
+      remoteAccessRequest.precheckDistanceKnown = measurementValid;
+      if (measurementValid) {
+        remoteAccessRequest.precheckDistanceCm = lastDistanceCm;
+        remoteAccessRequest.precheckPersonDetected =
+            isDistanceNear(lastDistanceCm);
+      }
+    }
+
+    bool shouldScan = shouldStartRemoteFingerprintScan(
+        remoteAccessRequest.direction,
+        systemLocked,
+        remoteAccessRequest.precheckDoorOpen,
+        remoteAccessRequest.precheckFingerprintReady,
+        remoteAccessRequest.precheckPersonKnown,
+        remoteAccessRequest.precheckPersonDetected);
+    if (!shouldScan) {
+      Serial.println("[ACCESS PRECHECK] Fingerprint scan not started.");
+      if (systemLocked) {
+        Serial.println("[ACCESS PRECHECK] Lockdown is active.");
+      } else if (remoteAccessRequest.precheckDoorOpen) {
+        Serial.println("[ACCESS PRECHECK] Door is already open.");
+      } else if (!remoteAccessRequest.precheckFingerprintReady) {
+        Serial.println("[ACCESS PRECHECK] Fingerprint sensor is unavailable.");
+      } else if (!remoteAccessRequest.precheckPersonKnown) {
+        Serial.println("[ACCESS PRECHECK] Fresh ultrasonic reading is unavailable.");
+      } else {
+        Serial.println("[ACCESS PRECHECK] No person detected within 20 cm.");
+      }
+      prepareRemoteAccessCheckPayload("NOT_SCANNED");
+      return;
+    }
+
+    remoteAccessRequest.workflowState =
+        REMOTE_FINGERPRINT_WAITING_FOR_FINGER;
+    remoteAccessRequest.scanStartedAt = millis();
+    Serial.println();
+    Serial.println("[REMOTE FINGERPRINT SCAN]");
+    Serial.print("Request: ");
+    Serial.println(remoteAccessRequest.requestId);
+    Serial.print("Direction: ");
+    Serial.println(getAccessModeName(remoteAccessRequest.direction));
+    Serial.println("Place one finger on the sensor (15 second timeout).");
+    lcdShowPlaceFinger();
+    presencePromptVisible = false;
+    return;
+  }
+
+  if (state == REMOTE_FINGERPRINT_WAITING_FOR_FINGER) {
+    if (millis() - remoteAccessRequest.scanStartedAt >=
+        FINGERPRINT_CAPTURE_TIMEOUT_MS) {
+      prepareRemoteAccessCheckPayload("TIMEOUT");
+      return;
+    }
+
+    uint8_t imageResult = finger.getImage();
+    RemoteFingerprintSensorOutcome outcome =
+        classifyRemoteFingerprintImageResult(imageResult);
+    if (outcome == REMOTE_SENSOR_KEEP_WAITING) {
+      return;
+    }
+    if (outcome == REMOTE_SENSOR_IMAGE_READY) {
+      remoteAccessRequest.workflowState =
+          REMOTE_FINGERPRINT_CONVERTING_IMAGE;
+      return;
+    }
+    Serial.print("[FINGERPRINT] Image read error: ");
+    Serial.println(getFingerprintError(imageResult));
+    prepareRemoteAccessCheckPayload("READ_ERROR");
+    return;
+  }
+
+  if (state == REMOTE_FINGERPRINT_CONVERTING_IMAGE) {
+    uint8_t conversionResult = finger.image2Tz();
+    if (conversionResult == FINGERPRINT_OK) {
+      remoteAccessRequest.workflowState = REMOTE_FINGERPRINT_SEARCHING;
+      return;
+    }
+    Serial.print("[FINGERPRINT] Image conversion error: ");
+    Serial.println(getFingerprintError(conversionResult));
+    prepareRemoteAccessCheckPayload("READ_ERROR");
+    return;
+  }
+
+  if (state == REMOTE_FINGERPRINT_SEARCHING) {
+    uint8_t searchResult = finger.fingerFastSearch();
+    RemoteFingerprintSensorOutcome outcome =
+        classifyRemoteFingerprintSearchResult(searchResult);
+    if (outcome == REMOTE_SENSOR_MATCH) {
+      prepareRemoteAccessCheckPayload(
+          "MATCH", finger.fingerID, finger.confidence);
+    } else if (outcome == REMOTE_SENSOR_NOT_RECOGNIZED) {
+      prepareRemoteAccessCheckPayload("NOT_RECOGNIZED");
+    } else {
+      Serial.print("[FINGERPRINT] Search error: ");
+      Serial.println(getFingerprintError(searchResult));
+      prepareRemoteAccessCheckPayload("READ_ERROR");
+    }
+    return;
+  }
+
+  if (state != REMOTE_ACCESS_CHECK_READY) {
+    return;
+  }
+  bool accessCheckCanReachCanonicalRequest =
+      integrationSyncState == INTEGRATION_SYNCED ||
+      (integrationSyncState == INTEGRATION_RECONCILIATION_REQUIRED &&
+       pendingAuthorizationId == remoteAccessRequest.requestId);
+  if (!accessCheckCanReachCanonicalRequest || !backendReachable ||
+      WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+
+  unsigned long now = millis();
+  if (remoteAccessRequest.lastAccessCheckAttemptAt != 0 &&
+      now - remoteAccessRequest.lastAccessCheckAttemptAt <
+          ACCESS_CHECK_RETRY_INTERVAL_MS) {
+    return;
+  }
+  remoteAccessRequest.lastAccessCheckAttemptAt = now;
+
+  String responseBody;
+  int responseCode = -1;
+  bool checked = postJson("/api/access/check",
+                          remoteAccessRequest.accessCheckPayload,
+                          responseBody,
+                          responseCode,
+                          HTTP_CODE_OK);
+  if (checked) {
+    handleRemoteAccessCheckResponse(responseBody);
+    return;
+  }
+
+  if (responseCode == HTTP_CODE_GONE) {
+    Serial.println("[ACCESS CHECK] Request is no longer actionable; checking canonical status.");
+    remoteAccessRequest.workflowState = REMOTE_ACCESS_CHECK_STATUS;
+    lastRemoteRequestStatusCheckAt = 0;
+    return;
+  }
+  if (responseCode < 0) {
+    markBackendUnavailable("Access check", responseCode);
+    Serial.println("[ACCESS CHECK] Captured result and exact payload retained for retry.");
+    return;
+  }
+
+  Serial.print("[ACCESS CHECK] Backend returned HTTP ");
+  Serial.print(responseCode);
+  Serial.println("; exact payload retained for retry.");
 }
 
 String getApiErrorDescription(const String& responseBody) {
@@ -1413,13 +1861,7 @@ void clearTrackedRemoteRequest(const String& requestId,
   if (remoteAccessRequest.active &&
       remoteAccessRequest.requestId == requestId) {
     serialOwned = remoteAccessRequest.createdBySerial;
-    remoteAccessRequest.active = false;
-    remoteAccessRequest.requestId = "";
-    remoteAccessRequest.area = AREA_NONE;
-    remoteAccessRequest.direction = MODE_ENTRY;
-    remoteAccessRequest.createdBySerial = false;
-    remoteAccessRequest.expiresAt = "";
-    remoteAccessRequest.receivedAt = 0;
+    resetRemoteAccessRequestState();
     cleared = true;
   }
   if (serialCreatedRequestId == requestId) {
@@ -1447,6 +1889,17 @@ void serviceRemoteRequestStatus() {
   String trackedRequestId = remoteAccessRequest.active
                                 ? remoteAccessRequest.requestId
                                 : serialCreatedRequestId;
+  if (remoteAccessRequest.active) {
+    RemoteFingerprintWorkflowState workflowState =
+        remoteAccessRequest.workflowState;
+    bool statusCheckAllowed =
+        workflowState == REMOTE_FINGERPRINT_PRECHECK ||
+        workflowState == REMOTE_FINGERPRINT_WAITING_FOR_FINGER ||
+        workflowState == REMOTE_ACCESS_CHECK_STATUS;
+    if (!statusCheckAllowed) {
+      return;
+    }
+  }
   if (trackedRequestId.length() == 0 ||
       integrationSyncState != INTEGRATION_SYNCED ||
       !backendReachable || WiFi.status() != WL_CONNECTED) {
@@ -1497,10 +1950,19 @@ void serviceRemoteRequestStatus() {
   }
 
   if (status == "QUEUED" || status == "IN_PROGRESS") {
+    if (remoteAccessRequest.active &&
+        remoteAccessRequest.workflowState == REMOTE_ACCESS_CHECK_STATUS &&
+        remoteAccessRequest.accessCheckPayload.length() > 0) {
+      remoteAccessRequest.workflowState = REMOTE_ACCESS_CHECK_READY;
+      remoteAccessRequest.lastAccessCheckAttemptAt = 0;
+    }
     return;
   }
   if (status == "AUTHORIZED_WAITING_DOOR") {
     pendingAuthorizationId = trackedRequestId;
+    if (remoteAccessRequest.active) {
+      remoteAccessRequest.workflowState = REMOTE_AUTHORIZED_WAITING_DOOR;
+    }
     setIntegrationSyncState(INTEGRATION_RECONCILIATION_REQUIRED);
     Serial.println("[ACCESS] Persistent authorization requires reconciliation; request preserved.");
     return;
@@ -1606,6 +2068,11 @@ bool applyHeartbeatResponse(const String& responseBody) {
       Serial.println(receivedPendingId);
     }
     pendingAuthorizationId = receivedPendingId;
+    if (remoteAccessRequest.active &&
+        remoteAccessRequest.requestId == receivedPendingId &&
+        remoteAccessRequest.workflowState != REMOTE_ACCESS_CHECK_READY) {
+      remoteAccessRequest.workflowState = REMOTE_AUTHORIZED_WAITING_DOOR;
+    }
     setIntegrationSyncState(INTEGRATION_RECONCILIATION_REQUIRED);
   }
 
@@ -1779,6 +2246,11 @@ bool applyBootstrapResponse(const String& responseBody) {
 
   if (hasPendingAuthorization) {
     pendingAuthorizationId = receivedPendingId;
+    if (remoteAccessRequest.active &&
+        remoteAccessRequest.requestId == receivedPendingId &&
+        remoteAccessRequest.workflowState != REMOTE_ACCESS_CHECK_READY) {
+      remoteAccessRequest.workflowState = REMOTE_AUTHORIZED_WAITING_DOOR;
+    }
     setIntegrationSyncState(INTEGRATION_RECONCILIATION_REQUIRED);
     Serial.println("[BACKEND] Bootstrap found a persistent pending authorization.");
     Serial.print("[BACKEND] Request/User/Area/Direction: ");
@@ -3877,6 +4349,111 @@ void runSoftwareValidation() {
            "command rejected",
            "command accepted while reconciliation required");
 
+  validate("Phase 6 Entry scan requires a fresh detected person",
+           shouldStartRemoteFingerprintScan(
+               MODE_ENTRY, false, false, true, true, true),
+           "scan allowed",
+           "scan blocked");
+  validate("Phase 6 Entry blocks missing or negative presence",
+           !shouldStartRemoteFingerprintScan(
+               MODE_ENTRY, false, false, true, false, false) &&
+               !shouldStartRemoteFingerprintScan(
+                   MODE_ENTRY, false, false, true, true, false),
+           "both blocked",
+           "Entry scan allowed without a detected person");
+  validate("Phase 6 Exit does not require presence",
+           shouldStartRemoteFingerprintScan(
+               MODE_EXIT, false, false, true, false, false),
+           "scan allowed",
+           "Exit scan incorrectly blocked by presence");
+  validate("Phase 6 safety prechecks block scanning",
+           !shouldStartRemoteFingerprintScan(
+               MODE_ENTRY, true, false, true, true, true) &&
+               !shouldStartRemoteFingerprintScan(
+                   MODE_ENTRY, false, true, true, true, true) &&
+               !shouldStartRemoteFingerprintScan(
+                   MODE_ENTRY, false, false, false, true, true),
+           "Lockdown, open door and unavailable sensor blocked",
+           "at least one unsafe scan was allowed");
+  validate("Phase 6 image result mapping is complete",
+           classifyRemoteFingerprintImageResult(FINGERPRINT_NOFINGER) ==
+                   REMOTE_SENSOR_KEEP_WAITING &&
+               classifyRemoteFingerprintImageResult(FINGERPRINT_OK) ==
+                   REMOTE_SENSOR_IMAGE_READY &&
+               classifyRemoteFingerprintImageResult(
+                   FINGERPRINT_PACKETRECIEVEERR) ==
+                   REMOTE_SENSOR_READ_ERROR,
+           "NOFINGER waits, OK advances, errors map to READ_ERROR",
+           "image result mapping mismatch");
+  validate("Phase 6 search result mapping is complete",
+           classifyRemoteFingerprintSearchResult(FINGERPRINT_OK) ==
+                   REMOTE_SENSOR_MATCH &&
+               classifyRemoteFingerprintSearchResult(FINGERPRINT_NOTFOUND) ==
+                   REMOTE_SENSOR_NOT_RECOGNIZED &&
+               classifyRemoteFingerprintSearchResult(
+                   FINGERPRINT_PACKETRECIEVEERR) ==
+                   REMOTE_SENSOR_READ_ERROR,
+           "MATCH, NOT_RECOGNIZED and READ_ERROR mapped",
+           "search result mapping mismatch");
+
+  integrationSyncState = INTEGRATION_SYNCED;
+  pendingAuthorizationId = "";
+  resetRemoteAccessRequestState();
+  remoteAccessRequest.active = true;
+  remoteAccessRequest.requestId = "validation_phase6_exact_id";
+  remoteAccessRequest.area = COMPANY_A;
+  remoteAccessRequest.direction = MODE_ENTRY;
+  remoteAccessRequest.precheckDoorOpen = false;
+  remoteAccessRequest.precheckPersonKnown = true;
+  remoteAccessRequest.precheckPersonDetected = true;
+  remoteAccessRequest.precheckDistanceKnown = true;
+  remoteAccessRequest.precheckDistanceCm = 10.5;
+  remoteAccessRequest.precheckFingerprintReady = true;
+  prepareRemoteAccessCheckPayload("MATCH", 1, 126);
+  JsonDocument matchPayload;
+  DeserializationError matchPayloadError = deserializeJson(
+      matchPayload, remoteAccessRequest.accessCheckPayload);
+  validate("Phase 6 MATCH payload reuses exact request and identity",
+           !matchPayloadError &&
+               matchPayload["request_id"] ==
+                   "validation_phase6_exact_id" &&
+               matchPayload["fingerprint_result"] == "MATCH" &&
+               matchPayload["fingerprint_id"] == 1 &&
+               matchPayload["confidence"] == 126,
+           "exact request ID with MATCH identity/confidence",
+           "MATCH payload mismatch");
+
+  String immutablePayload = remoteAccessRequest.accessCheckPayload;
+  prepareRemoteAccessCheckPayload("NOT_RECOGNIZED");
+  validate("Phase 6 access-check retry payload is immutable",
+           remoteAccessRequest.accessCheckPayload == immutablePayload,
+           "byte-for-byte identical payload",
+           "captured payload changed before retry");
+  validate("Phase 6 captured result prevents a second sensor scan",
+           remoteAccessRequest.workflowState == REMOTE_ACCESS_CHECK_READY &&
+               !isRemoteFingerprintSensorStep(
+                   remoteAccessRequest.workflowState),
+           "payload ready and sensor inactive",
+           "sensor workflow remained active");
+
+  resetRemoteAccessRequestState();
+  remoteAccessRequest.active = true;
+  remoteAccessRequest.requestId = "validation_phase6_no_identity";
+  remoteAccessRequest.area = COMPANY_A;
+  remoteAccessRequest.direction = MODE_ENTRY;
+  remoteAccessRequest.precheckFingerprintReady = true;
+  prepareRemoteAccessCheckPayload("TIMEOUT");
+  JsonDocument timeoutPayload;
+  DeserializationError timeoutPayloadError = deserializeJson(
+      timeoutPayload, remoteAccessRequest.accessCheckPayload);
+  validate("Phase 6 non-MATCH payload omits fingerprint identity",
+           !timeoutPayloadError &&
+               timeoutPayload["fingerprint_result"] == "TIMEOUT" &&
+               timeoutPayload["fingerprint_id"].isNull() &&
+               timeoutPayload["confidence"].isNull(),
+           "TIMEOUT without fingerprint_id or confidence",
+           "non-MATCH payload exposed identity fields");
+
   restoreAccessControlState(remoteCommandAccessState);
   fingerprintReady = remoteCommandFingerprintReady;
   integrationSyncState = savedIntegrationSyncState;
@@ -3945,7 +4522,13 @@ void printRemoteAccessStatus() {
     Serial.println(getAreaName(remoteAccessRequest.area));
     Serial.print("  Direction: ");
     Serial.println(getAccessModeName(remoteAccessRequest.direction));
-    Serial.println("  State: WAITING_FOR_PHASE6_SCAN");
+    Serial.print("  State: ");
+    Serial.println(getRemoteFingerprintWorkflowName(
+        remoteAccessRequest.workflowState));
+    if (remoteAccessRequest.fingerprintResult.length() > 0) {
+      Serial.print("  Fingerprint Result: ");
+      Serial.println(remoteAccessRequest.fingerprintResult);
+    }
     return;
   }
   if (serialCreatedRequestId.length() > 0) {
