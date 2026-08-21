@@ -368,9 +368,28 @@ enum WiFiConnectionState {
   WIFI_CONNECTION_RETRY_WAIT
 };
 
+enum RemoteCommandDecision {
+  REMOTE_COMMAND_ACCEPT,
+  REMOTE_COMMAND_DUPLICATE,
+  REMOTE_COMMAND_REJECT_INVALID,
+  REMOTE_COMMAND_REJECT_NOT_READY,
+  REMOTE_COMMAND_REJECT_CONFLICT
+};
+
+struct RemoteAccessRequestState {
+  bool active;
+  String requestId;
+  Area area;
+  AccessMode direction;
+  bool createdBySerial;
+  String expiresAt;
+  unsigned long receivedAt;
+};
+
 constexpr unsigned long WIFI_CONNECTION_ATTEMPT_TIMEOUT_MS = 15000;
 constexpr unsigned long WIFI_RETRY_DELAY_MS = 5000;
 constexpr unsigned long HEARTBEAT_INTERVAL_MS = 2000;
+constexpr unsigned long REMOTE_REQUEST_STATUS_INTERVAL_MS = 2000;
 constexpr unsigned long BACKEND_RETRY_INTERVAL_MS = 5000;
 constexpr unsigned long BACKEND_FAILURE_LOG_INTERVAL_MS = 15000;
 constexpr uint16_t HTTP_CONNECT_TIMEOUT_MS = 1000;
@@ -381,6 +400,10 @@ IntegrationSyncState integrationSyncState = INTEGRATION_UNSYNCED;
 String bootId;
 String pendingAuthorizationId;
 String lastUnexpectedCommandId;
+RemoteAccessRequestState remoteAccessRequest;
+String serialCreatedRequestId;
+Area serialCreatedRequestArea = AREA_NONE;
+AccessMode serialCreatedRequestDirection = MODE_ENTRY;
 WiFiConnectionState wifiConnectionState = WIFI_CONNECTION_IDLE;
 bool wifiWasConnected = false;
 bool backendReachable = false;
@@ -389,6 +412,7 @@ bool backendAdminMode = false;
 unsigned long wifiConnectionAttemptStartedAt = 0;
 unsigned long wifiRetryScheduledAt = 0;
 unsigned long lastHeartbeatAttemptAt = 0;
+unsigned long lastRemoteRequestStatusCheckAt = 0;
 unsigned long lastBackendSyncAttemptAt = 0;
 unsigned long lastBackendFailureLogAt = 0;
 #endif
@@ -431,12 +455,25 @@ bool fetchBootstrap();
 bool postJson(const char* path,
               const String& requestBody,
               String& responseBody,
-              int& responseCode);
+              int& responseCode,
+              int expectedResponseCode);
 bool getJson(const char* path,
              String& responseBody,
              int& responseCode);
 bool applyHeartbeatResponse(const String& responseBody);
 bool applyBootstrapResponse(const String& responseBody);
+bool parseRemoteDirection(const String& value, AccessMode& direction);
+RemoteCommandDecision evaluateRemoteCommand(
+    const String& requestId,
+    int areaId,
+    AccessMode direction);
+void handleRemoteCommand(JsonObject command);
+void serviceRemoteRequestStatus();
+void clearTrackedRemoteRequest(const String& requestId,
+                               const String& terminalState);
+void createIntegratedSerialAccessRequest();
+String getApiErrorDescription(const String& responseBody);
+void printRemoteAccessStatus();
 bool parseCanonicalSecurity(JsonDocument& document,
                             int& canonicalFailedAttempts,
                             bool& canonicalLockdown,
@@ -959,6 +996,17 @@ void setupNetworkIntegration() {
   backendReachable = false;
   pendingAuthorizationId = "";
   wifiConnectionState = WIFI_CONNECTION_IDLE;
+  remoteAccessRequest.active = false;
+  remoteAccessRequest.requestId = "";
+  remoteAccessRequest.area = AREA_NONE;
+  remoteAccessRequest.direction = MODE_ENTRY;
+  remoteAccessRequest.createdBySerial = false;
+  remoteAccessRequest.expiresAt = "";
+  remoteAccessRequest.receivedAt = 0;
+  serialCreatedRequestId = "";
+  serialCreatedRequestArea = AREA_NONE;
+  serialCreatedRequestDirection = MODE_ENTRY;
+  lastRemoteRequestStatusCheckAt = 0;
 
   Serial.println("[INTEGRATION] Mode: INTEGRATED");
   Serial.print("[INTEGRATION] Boot ID: ");
@@ -1055,12 +1103,14 @@ void serviceNetworkIntegration() {
       now - lastHeartbeatAttemptAt >= HEARTBEAT_INTERVAL_MS) {
     sendHeartbeat();
   }
+  serviceRemoteRequestStatus();
 }
 
 bool postJson(const char* path,
               const String& requestBody,
               String& responseBody,
-              int& responseCode) {
+              int& responseCode,
+              int expectedResponseCode) {
   responseBody = "";
   responseCode = -1;
   if (WiFi.status() != WL_CONNECTED) {
@@ -1082,7 +1132,7 @@ bool postJson(const char* path,
     responseBody = http.getString();
   }
   http.end();
-  return responseCode == HTTP_CODE_OK;
+  return responseCode == expectedResponseCode;
 }
 
 bool getJson(const char* path,
@@ -1109,6 +1159,358 @@ bool getJson(const char* path,
   }
   http.end();
   return responseCode == HTTP_CODE_OK;
+}
+
+bool parseRemoteDirection(const String& value, AccessMode& direction) {
+  if (value == "ENTRY") {
+    direction = MODE_ENTRY;
+    return true;
+  }
+  if (value == "EXIT") {
+    direction = MODE_EXIT;
+    return true;
+  }
+  return false;
+}
+
+RemoteCommandDecision evaluateRemoteCommand(
+    const String& requestId,
+    int areaId,
+    AccessMode direction) {
+  String trimmedRequestId = requestId;
+  trimmedRequestId.trim();
+  if (requestId.length() == 0 || trimmedRequestId != requestId ||
+      areaId < static_cast<int>(COMPANY_A) ||
+      areaId > static_cast<int>(MAIN_ENTRANCE)) {
+    return REMOTE_COMMAND_REJECT_INVALID;
+  }
+
+  if (integrationSyncState != INTEGRATION_SYNCED ||
+      pendingAuthorizationId.length() > 0) {
+    return REMOTE_COMMAND_REJECT_NOT_READY;
+  }
+
+  Area incomingArea = static_cast<Area>(areaId);
+  if (remoteAccessRequest.active) {
+    if (remoteAccessRequest.requestId == requestId &&
+        remoteAccessRequest.area == incomingArea &&
+        remoteAccessRequest.direction == direction) {
+      return REMOTE_COMMAND_DUPLICATE;
+    }
+    return REMOTE_COMMAND_REJECT_CONFLICT;
+  }
+
+  if (serialCreatedRequestId.length() > 0 &&
+      (serialCreatedRequestId != requestId ||
+       serialCreatedRequestArea != incomingArea ||
+       serialCreatedRequestDirection != direction)) {
+    return REMOTE_COMMAND_REJECT_CONFLICT;
+  }
+  return REMOTE_COMMAND_ACCEPT;
+}
+
+void handleRemoteCommand(JsonObject command) {
+  bool fieldsValid = command["request_id"].is<const char*>() &&
+                     command["area_id"].is<int>() &&
+                     command["direction"].is<const char*>() &&
+                     command["expires_at"].is<const char*>();
+  String requestId = fieldsValid
+                         ? String(command["request_id"].as<const char*>())
+                         : String("MALFORMED");
+  int areaId = fieldsValid ? command["area_id"].as<int>() : 0;
+  String directionValue = fieldsValid
+                              ? String(command["direction"].as<const char*>())
+                              : String("");
+  String expiresAt = fieldsValid
+                         ? String(command["expires_at"].as<const char*>())
+                         : String("");
+  String diagnosticId = requestId.length() > 0
+                            ? requestId
+                            : String("MALFORMED_EMPTY_ID");
+  AccessMode direction = MODE_ENTRY;
+  if (!fieldsValid || expiresAt.length() == 0 ||
+      !parseRemoteDirection(directionValue, direction)) {
+    if (lastUnexpectedCommandId != diagnosticId) {
+      Serial.println("[ACCESS] Malformed command ignored");
+      Serial.println("[ACCESS] No acknowledgement or hardware action performed.");
+      lastUnexpectedCommandId = diagnosticId;
+    }
+    return;
+  }
+
+  RemoteCommandDecision decision =
+      evaluateRemoteCommand(requestId, areaId, direction);
+  if (decision == REMOTE_COMMAND_DUPLICATE) {
+    return;
+  }
+  if (decision != REMOTE_COMMAND_ACCEPT) {
+    if (lastUnexpectedCommandId != diagnosticId) {
+      Serial.print("[ACCESS] Command rejected: ");
+      if (decision == REMOTE_COMMAND_REJECT_INVALID) {
+        Serial.println("invalid request fields");
+      } else if (decision == REMOTE_COMMAND_REJECT_NOT_READY) {
+        Serial.println("station is not ready or requires reconciliation");
+      } else {
+        Serial.println("another request is already tracked");
+      }
+      Serial.println("[ACCESS] No acknowledgement or hardware action performed.");
+      lastUnexpectedCommandId = diagnosticId;
+    }
+    return;
+  }
+
+  remoteAccessRequest.active = true;
+  remoteAccessRequest.requestId = requestId;
+  remoteAccessRequest.area = static_cast<Area>(areaId);
+  remoteAccessRequest.direction = direction;
+  remoteAccessRequest.createdBySerial =
+      serialCreatedRequestId == requestId;
+  remoteAccessRequest.expiresAt = expiresAt;
+  remoteAccessRequest.receivedAt = millis();
+  if (remoteAccessRequest.createdBySerial) {
+    serialCreatedRequestId = "";
+    serialCreatedRequestArea = AREA_NONE;
+    serialCreatedRequestDirection = MODE_ENTRY;
+  }
+  lastRemoteRequestStatusCheckAt = 0;
+  lastUnexpectedCommandId = "";
+
+  Serial.println();
+  Serial.println("[ACCESS] Command received");
+  Serial.print("[ACCESS] Request: ");
+  Serial.println(remoteAccessRequest.requestId);
+  Serial.print("[ACCESS] Area: ");
+  Serial.print(areaId);
+  Serial.print(" - ");
+  Serial.println(getAreaName(remoteAccessRequest.area));
+  Serial.print("[ACCESS] Direction: ");
+  Serial.println(getAccessModeName(remoteAccessRequest.direction));
+  Serial.println("[ACCESS] Waiting for Phase 6 fingerprint processing");
+  Serial.println("[ACCESS] No fingerprint scan or servo action in Phase 5.");
+  Serial.println();
+}
+
+String getApiErrorDescription(const String& responseBody) {
+  JsonDocument document;
+  if (deserializeJson(document, responseBody)) {
+    return "Backend response could not be parsed";
+  }
+  JsonVariant detail = document["detail"];
+  if (!detail.is<JsonObject>()) {
+    return "Backend rejected the request";
+  }
+  const char* reason = detail["reason_code"] | "BACKEND_REJECTED";
+  const char* message = detail["message"] | "Request rejected";
+  return String(reason) + ": " + String(message);
+}
+
+void createIntegratedSerialAccessRequest() {
+  AccessMode requestedDirection = currentMode;
+  if (selectedArea == AREA_NONE) {
+    Serial.println("[ACCESS REQUEST ERROR]");
+    Serial.println("Select an area first using 1-7.");
+    returnToEntryMode();
+    return;
+  }
+  if (integrationSyncState != INTEGRATION_SYNCED ||
+      !backendReachable || WiFi.status() != WL_CONNECTED ||
+      pendingAuthorizationId.length() > 0) {
+    Serial.println("[ACCESS REQUEST BLOCKED]");
+    Serial.println("Integrated Backend is not SYNCED and ready.");
+    returnToEntryMode();
+    return;
+  }
+  bool existingRequestIsSerialOwned =
+      serialCreatedRequestId.length() > 0 ||
+      (remoteAccessRequest.active && remoteAccessRequest.createdBySerial);
+  if (existingRequestIsSerialOwned) {
+    Serial.println("[ACCESS REQUEST BLOCKED]");
+    Serial.println("This Serial access request is already tracked locally.");
+    // A duplicate R must not consume the Exit Mode owned by the request that
+    // is already in progress. App-owned collisions still reach FastAPI below
+    // so its canonical REQUEST_IN_PROGRESS response remains authoritative.
+    return;
+  }
+
+  JsonDocument request;
+  request["area_id"] = static_cast<int>(selectedArea);
+  request["direction"] = getAccessModeName(requestedDirection);
+  String requestBody;
+  requestBody.reserve(64);
+  serializeJson(request, requestBody);
+
+  String responseBody;
+  int responseCode = -1;
+  bool accepted = postJson("/api/access/requests",
+                           requestBody,
+                           responseBody,
+                           responseCode,
+                           HTTP_CODE_ACCEPTED);
+  if (!accepted) {
+    Serial.println("[ACCESS REQUEST REJECTED]");
+    Serial.print("HTTP/code: ");
+    Serial.println(responseCode);
+    if (responseBody.length() > 0) {
+      Serial.println(getApiErrorDescription(responseBody));
+    }
+    if (responseCode < 0) {
+      markBackendUnavailable("Access request creation", responseCode);
+    }
+    // R consumes the one-attempt Exit Mode just like the original local flow.
+    returnToEntryMode();
+    return;
+  }
+
+  JsonDocument response;
+  DeserializationError jsonError = deserializeJson(response, responseBody);
+  bool responseValid = !jsonError &&
+                       response["request_id"].is<const char*>() &&
+                       response["status"].is<const char*>() &&
+                       response["area_id"].is<int>() &&
+                       response["direction"].is<const char*>() &&
+                       response["expires_at"].is<const char*>();
+  String canonicalRequestId = responseValid
+                                  ? String(response["request_id"].as<const char*>())
+                                  : String("");
+  String canonicalStatus = responseValid
+                               ? String(response["status"].as<const char*>())
+                               : String("");
+  String canonicalDirection = responseValid
+                                  ? String(response["direction"].as<const char*>())
+                                  : String("");
+  if (!responseValid || canonicalRequestId.length() == 0 ||
+      canonicalStatus != "QUEUED" ||
+      response["area_id"].as<int>() != static_cast<int>(selectedArea) ||
+      canonicalDirection != getAccessModeName(requestedDirection)) {
+    Serial.println("[ACCESS REQUEST ERROR]");
+    Serial.println("Backend returned an invalid creation response; request will not be acknowledged.");
+    returnToEntryMode();
+    return;
+  }
+
+  serialCreatedRequestId = canonicalRequestId;
+  serialCreatedRequestArea = selectedArea;
+  serialCreatedRequestDirection = requestedDirection;
+  lastRemoteRequestStatusCheckAt = 0;
+  Serial.println();
+  Serial.println("[ACCESS REQUEST CREATED]");
+  Serial.print("Request: ");
+  Serial.println(serialCreatedRequestId);
+  Serial.print("Area: ");
+  Serial.print(static_cast<int>(serialCreatedRequestArea));
+  Serial.print(" - ");
+  Serial.println(getAreaName(serialCreatedRequestArea));
+  Serial.print("Direction: ");
+  Serial.println(getAccessModeName(serialCreatedRequestDirection));
+  Serial.println("Waiting for heartbeat command delivery.");
+  Serial.println();
+}
+
+void clearTrackedRemoteRequest(const String& requestId,
+                               const String& terminalState) {
+  bool serialOwned = false;
+  bool cleared = false;
+  if (remoteAccessRequest.active &&
+      remoteAccessRequest.requestId == requestId) {
+    serialOwned = remoteAccessRequest.createdBySerial;
+    remoteAccessRequest.active = false;
+    remoteAccessRequest.requestId = "";
+    remoteAccessRequest.area = AREA_NONE;
+    remoteAccessRequest.direction = MODE_ENTRY;
+    remoteAccessRequest.createdBySerial = false;
+    remoteAccessRequest.expiresAt = "";
+    remoteAccessRequest.receivedAt = 0;
+    cleared = true;
+  }
+  if (serialCreatedRequestId == requestId) {
+    serialOwned = true;
+    serialCreatedRequestId = "";
+    serialCreatedRequestArea = AREA_NONE;
+    serialCreatedRequestDirection = MODE_ENTRY;
+    cleared = true;
+  }
+  if (!cleared) {
+    return;
+  }
+
+  lastRemoteRequestStatusCheckAt = 0;
+  Serial.print("[ACCESS] Request ");
+  Serial.print(requestId);
+  Serial.print(" finished: ");
+  Serial.println(terminalState);
+  if (serialOwned) {
+    returnToEntryMode();
+  }
+}
+
+void serviceRemoteRequestStatus() {
+  String trackedRequestId = remoteAccessRequest.active
+                                ? remoteAccessRequest.requestId
+                                : serialCreatedRequestId;
+  if (trackedRequestId.length() == 0 ||
+      integrationSyncState != INTEGRATION_SYNCED ||
+      !backendReachable || WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+
+  unsigned long now = millis();
+  if (lastRemoteRequestStatusCheckAt != 0 &&
+      now - lastRemoteRequestStatusCheckAt <
+          REMOTE_REQUEST_STATUS_INTERVAL_MS) {
+    return;
+  }
+  lastRemoteRequestStatusCheckAt = now;
+
+  String path = "/api/access/requests/" + trackedRequestId;
+  String responseBody;
+  int responseCode = -1;
+  bool statusAvailable = getJson(path.c_str(), responseBody, responseCode);
+  if (responseCode == HTTP_CODE_GONE) {
+    if (pendingAuthorizationId.length() == 0 &&
+        integrationSyncState != INTEGRATION_RECONCILIATION_REQUIRED) {
+      clearTrackedRemoteRequest(trackedRequestId, "EXPIRED");
+    }
+    return;
+  }
+  if (!statusAvailable) {
+    if (responseCode < 0) {
+      markBackendUnavailable("Request status", responseCode);
+    } else {
+      Serial.print("[ACCESS] Status check returned HTTP ");
+      Serial.println(responseCode);
+    }
+    return;
+  }
+
+  JsonDocument response;
+  DeserializationError jsonError = deserializeJson(response, responseBody);
+  if (jsonError || !response["request_id"].is<const char*>() ||
+      !response["status"].is<const char*>()) {
+    Serial.println("[ACCESS] Invalid request-status response ignored.");
+    return;
+  }
+  String responseRequestId = response["request_id"].as<const char*>();
+  String status = response["status"].as<const char*>();
+  if (responseRequestId != trackedRequestId) {
+    Serial.println("[ACCESS] Mismatched request-status response ignored.");
+    return;
+  }
+
+  if (status == "QUEUED" || status == "IN_PROGRESS") {
+    return;
+  }
+  if (status == "AUTHORIZED_WAITING_DOOR") {
+    pendingAuthorizationId = trackedRequestId;
+    setIntegrationSyncState(INTEGRATION_RECONCILIATION_REQUIRED);
+    Serial.println("[ACCESS] Persistent authorization requires reconciliation; request preserved.");
+    return;
+  }
+  if (status == "GRANTED" || status == "DENIED" ||
+      status == "FAILED" || status == "EXPIRED") {
+    clearTrackedRemoteRequest(trackedRequestId, status);
+    return;
+  }
+  Serial.println("[ACCESS] Unknown request status ignored.");
 }
 
 bool parseCanonicalSecurity(JsonDocument& document,
@@ -1188,9 +1590,8 @@ bool applyHeartbeatResponse(const String& responseBody) {
 
   JsonVariant pendingRequest = document["pending_request_id"];
   JsonVariant command = document["command"];
-  if ((!pendingRequest.isNull() && !pendingRequest.is<const char*>()) ||
-      (!command.isNull() && !command.is<JsonObject>())) {
-    Serial.println("[BACKEND] Heartbeat nullable fields are invalid.");
+  if (!pendingRequest.isNull() && !pendingRequest.is<const char*>()) {
+    Serial.println("[BACKEND] Heartbeat pending-request field is invalid.");
     return false;
   }
 
@@ -1209,16 +1610,13 @@ bool applyHeartbeatResponse(const String& responseBody) {
   }
 
   if (!command.isNull()) {
-    const char* receivedRequestId = command["request_id"] | "unknown";
-    String commandId = receivedRequestId;
-    if (commandId != lastUnexpectedCommandId) {
-      Serial.print("[BACKEND] Access command ignored in Phase 4: ");
-      Serial.println(commandId);
-      Serial.println("[BACKEND] No acknowledgement, fingerprint scan, or servo movement performed.");
-      lastUnexpectedCommandId = commandId;
+    if (command.is<JsonObject>()) {
+      handleRemoteCommand(command.as<JsonObject>());
+    } else if (lastUnexpectedCommandId != "MALFORMED_COMMAND_TYPE") {
+      Serial.println("[ACCESS] Malformed command ignored");
+      Serial.println("[ACCESS] No acknowledgement or hardware action performed.");
+      lastUnexpectedCommandId = "MALFORMED_COMMAND_TYPE";
     }
-  } else {
-    lastUnexpectedCommandId = "";
   }
   return true;
 }
@@ -1240,7 +1638,11 @@ bool sendHeartbeat() {
   }
   request["fingerprint_ready"] = fingerprintReady;
   request["admin_mode"] = adminMode;
-  request["active_request_id"] = nullptr;
+  if (remoteAccessRequest.active) {
+    request["active_request_id"] = remoteAccessRequest.requestId;
+  } else {
+    request["active_request_id"] = nullptr;
+  }
 
   String requestBody;
   requestBody.reserve(256);
@@ -1251,7 +1653,8 @@ bool sendHeartbeat() {
   if (!postJson("/api/esp32/heartbeat",
                 requestBody,
                 responseBody,
-                responseCode) ||
+                responseCode,
+                HTTP_CODE_OK) ||
       !applyHeartbeatResponse(responseBody)) {
     markBackendUnavailable("Heartbeat", responseCode);
     return false;
@@ -3378,6 +3781,114 @@ void runSoftwareValidation() {
            "no conflicts",
            "conflict found");
 
+#if SMART_OFFICE_MODE == INTEGRATED_MODE
+  IntegrationSyncState savedIntegrationSyncState = integrationSyncState;
+  String savedPendingAuthorizationId = pendingAuthorizationId;
+  String savedUnexpectedCommandId = lastUnexpectedCommandId;
+  RemoteAccessRequestState savedRemoteAccessRequest = remoteAccessRequest;
+  String savedSerialCreatedRequestId = serialCreatedRequestId;
+  Area savedSerialCreatedRequestArea = serialCreatedRequestArea;
+  AccessMode savedSerialCreatedRequestDirection =
+      serialCreatedRequestDirection;
+  unsigned long savedRemoteStatusCheckAt =
+      lastRemoteRequestStatusCheckAt;
+  AccessControlStateSnapshot remoteCommandAccessState =
+      captureAccessControlState();
+  bool remoteCommandFingerprintReady = fingerprintReady;
+
+  integrationSyncState = INTEGRATION_SYNCED;
+  pendingAuthorizationId = "";
+  lastUnexpectedCommandId = "";
+  remoteAccessRequest.active = false;
+  remoteAccessRequest.requestId = "";
+  serialCreatedRequestId = "";
+
+  JsonDocument invalidAreaCommand;
+  invalidAreaCommand["request_id"] = "validation_invalid_area";
+  invalidAreaCommand["area_id"] = 8;
+  invalidAreaCommand["direction"] = "ENTRY";
+  invalidAreaCommand["expires_at"] = "2099-01-01T00:00:00Z";
+  handleRemoteCommand(invalidAreaCommand.as<JsonObject>());
+  validate("Phase 5 malformed command area is rejected",
+           !remoteAccessRequest.active,
+           "no active remote request",
+           "invalid command became active");
+
+  JsonDocument invalidDirectionCommand;
+  invalidDirectionCommand["request_id"] = "validation_invalid_direction";
+  invalidDirectionCommand["area_id"] = 1;
+  invalidDirectionCommand["direction"] = "SIDEWAYS";
+  invalidDirectionCommand["expires_at"] = "2099-01-01T00:00:00Z";
+  handleRemoteCommand(invalidDirectionCommand.as<JsonObject>());
+  validate("Phase 5 malformed command direction is rejected",
+           !remoteAccessRequest.active,
+           "no active remote request",
+           "invalid command became active");
+
+  JsonDocument validRemoteCommand;
+  validRemoteCommand["request_id"] = "validation_req_a";
+  validRemoteCommand["area_id"] = 1;
+  validRemoteCommand["direction"] = "ENTRY";
+  validRemoteCommand["expires_at"] = "2099-01-01T00:00:00Z";
+  handleRemoteCommand(validRemoteCommand.as<JsonObject>());
+  validate("Phase 5 valid command is accepted once",
+           remoteAccessRequest.active &&
+               remoteAccessRequest.requestId == "validation_req_a" &&
+               remoteAccessRequest.area == COMPANY_A &&
+               remoteAccessRequest.direction == MODE_ENTRY,
+           "req_a active for Company A Entry",
+           "valid command state mismatch");
+
+  unsigned long firstReceivedAt = remoteAccessRequest.receivedAt;
+  handleRemoteCommand(validRemoteCommand.as<JsonObject>());
+  validate("Phase 5 duplicate command redelivery is idempotent",
+           remoteAccessRequest.active &&
+               remoteAccessRequest.requestId == "validation_req_a" &&
+               remoteAccessRequest.receivedAt == firstReceivedAt,
+           "original request state unchanged",
+           "duplicate changed request state");
+
+  JsonDocument conflictingRemoteCommand;
+  conflictingRemoteCommand["request_id"] = "validation_req_b";
+  conflictingRemoteCommand["area_id"] = 2;
+  conflictingRemoteCommand["direction"] = "EXIT";
+  conflictingRemoteCommand["expires_at"] = "2099-01-01T00:00:00Z";
+  handleRemoteCommand(conflictingRemoteCommand.as<JsonObject>());
+  validate("Phase 5 different command cannot replace active request",
+           remoteAccessRequest.active &&
+               remoteAccessRequest.requestId == "validation_req_a" &&
+               remoteAccessRequest.area == COMPANY_A &&
+               remoteAccessRequest.direction == MODE_ENTRY,
+           "req_a preserved",
+           "active request was replaced");
+
+  validate("Phase 5 command handling has no access hardware/business side effect",
+           isAccessControlStateUnchanged(remoteCommandAccessState) &&
+               fingerprintReady == remoteCommandFingerprintReady,
+           "door, attendance, security, mode and fingerprint state unchanged",
+           "access-control or fingerprint state changed");
+
+  remoteAccessRequest.active = false;
+  remoteAccessRequest.requestId = "";
+  integrationSyncState = INTEGRATION_RECONCILIATION_REQUIRED;
+  handleRemoteCommand(validRemoteCommand.as<JsonObject>());
+  validate("Phase 5 reconciliation state blocks command acceptance",
+           !remoteAccessRequest.active,
+           "command rejected",
+           "command accepted while reconciliation required");
+
+  restoreAccessControlState(remoteCommandAccessState);
+  fingerprintReady = remoteCommandFingerprintReady;
+  integrationSyncState = savedIntegrationSyncState;
+  pendingAuthorizationId = savedPendingAuthorizationId;
+  lastUnexpectedCommandId = savedUnexpectedCommandId;
+  remoteAccessRequest = savedRemoteAccessRequest;
+  serialCreatedRequestId = savedSerialCreatedRequestId;
+  serialCreatedRequestArea = savedSerialCreatedRequestArea;
+  serialCreatedRequestDirection = savedSerialCreatedRequestDirection;
+  lastRemoteRequestStatusCheckAt = savedRemoteStatusCheckAt;
+#endif
+
   for (size_t i = 0; i < USER_COUNT; ++i) {
     users[i].insideMask = savedInsideMasks[i];
   }
@@ -3424,6 +3935,33 @@ void runSoftwareValidation() {
   Serial.println();
 }
 
+#if SMART_OFFICE_MODE == INTEGRATED_MODE
+void printRemoteAccessStatus() {
+  Serial.println("Remote Access Request:");
+  if (remoteAccessRequest.active) {
+    Serial.print("  Request ID: ");
+    Serial.println(remoteAccessRequest.requestId);
+    Serial.print("  Area: ");
+    Serial.println(getAreaName(remoteAccessRequest.area));
+    Serial.print("  Direction: ");
+    Serial.println(getAccessModeName(remoteAccessRequest.direction));
+    Serial.println("  State: WAITING_FOR_PHASE6_SCAN");
+    return;
+  }
+  if (serialCreatedRequestId.length() > 0) {
+    Serial.print("  Request ID: ");
+    Serial.println(serialCreatedRequestId);
+    Serial.print("  Area: ");
+    Serial.println(getAreaName(serialCreatedRequestArea));
+    Serial.print("  Direction: ");
+    Serial.println(getAccessModeName(serialCreatedRequestDirection));
+    Serial.println("  State: WAITING_FOR_HEARTBEAT_DELIVERY");
+    return;
+  }
+  Serial.println("  NONE");
+}
+#endif
+
 void printIntegrationStatus() {
 #if SMART_OFFICE_MODE == INTEGRATED_MODE
   Serial.println("Integration Mode: INTEGRATED");
@@ -3443,6 +3981,7 @@ void printIntegrationStatus() {
   Serial.println(pendingAuthorizationId.length() > 0
                      ? pendingAuthorizationId
                      : String("NONE"));
+  printRemoteAccessStatus();
 #else
   Serial.println("Integration Mode: STANDALONE");
   Serial.println("Wi-Fi: DISABLED");
@@ -4341,7 +4880,11 @@ void processSerialInput(String input) {
       break;
 
     case 'R':
+#if SMART_OFFICE_MODE == INTEGRATED_MODE
+      createIntegratedSerialAccessRequest();
+#else
       testFingerprintAccess();
+#endif
       break;
 
     case 'F':
