@@ -2,4 +2,7 @@
 __pycache__/
 *.py[cod]
 smart_office.db
+smart_office.pre_final_integration.*.db
+smart_office.migration_test.*.db
+smart_office.phase3_simulation.db
 .pytest_cache/

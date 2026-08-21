@@ -19,4 +19,5 @@ echo Starting Smart Office Backend from:
 echo %CD%
 echo.
 echo Press Ctrl+C to stop the server.
+set "SMART_OFFICE_DATABASE_PATH="
 ".venv\Scripts\python.exe" -m uvicorn app.main:app --host 0.0.0.0 --port 8000

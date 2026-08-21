@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import CheckConstraint
+from sqlalchemy import CheckConstraint, Index, text
 from sqlmodel import Field, Relationship, SQLModel
 
 
@@ -75,9 +75,15 @@ class AccessLog(SQLModel, table=True):
         CheckConstraint("direction IN ('ENTRY', 'EXIT')"),
         CheckConstraint("decision IN ('GRANTED', 'DENIED')"),
         CheckConstraint("authentication_method IN ('FINGERPRINT', 'RFID')"),
+        Index(
+            "ux_AccessLogs_request_id_nonnull",
+            "request_id",
+            unique=True,
+            sqlite_where=text("request_id IS NOT NULL"),
+        ),
     )
 
-    access_log_id: int = Field(primary_key=True)
+    access_log_id: int | None = Field(default=None, primary_key=True)
     user_id: int | None = Field(default=None, foreign_key="Users.user_id")
     area_id: int = Field(foreign_key="Areas.area_id")
     direction: str
@@ -85,6 +91,8 @@ class AccessLog(SQLModel, table=True):
     denial_reason: str | None = Field(default=None)
     authentication_method: str
     event_timestamp: datetime = Field(default_factory=utc_now)
+    request_id: str | None = Field(default=None)
+    request_created_at: datetime | None = Field(default=None)
 
     user: User | None = Relationship(back_populates="access_logs")
     area: Area = Relationship(back_populates="access_logs")
@@ -106,3 +114,14 @@ class SystemState(SQLModel, table=True):
     esp32_online: bool = Field(default=False)
     esp32_last_seen_at: datetime | None = Field(default=None)
     last_updated_at: datetime = Field(default_factory=utc_now)
+    pending_request_id: str | None = Field(default=None)
+    pending_user_id: int | None = Field(default=None, foreign_key="Users.user_id")
+    pending_area_id: int | None = Field(default=None, foreign_key="Areas.area_id")
+    pending_direction: str | None = Field(default=None)
+    pending_created_at: datetime | None = Field(default=None)
+    pending_authorized_at: datetime | None = Field(default=None)
+    pending_expires_at: datetime | None = Field(default=None)
+    last_security_boot_id: str | None = Field(default=None)
+    last_security_event_id: str | None = Field(default=None)
+    last_security_event_type: str | None = Field(default=None)
+    last_security_event_at: datetime | None = Field(default=None)

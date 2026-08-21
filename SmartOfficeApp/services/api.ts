@@ -1,5 +1,10 @@
 import type {
+  AccessDirection,
   AccessLog,
+  AccessReasonCode,
+  AccessRequest,
+  AccessRequestLifecycle,
+  AccessRequestResult,
   DashboardData,
   SmartOfficeArea,
   SmartOfficeSystemState,
@@ -20,6 +25,37 @@ type SystemStateDto = {
   esp32_online: boolean;
   esp32_last_seen_at: string | null;
   last_updated_at: string;
+  person_detected: boolean | null;
+  distance_cm: number | null;
+  fingerprint_ready: boolean | null;
+  active_access_request: ActiveAccessRequestDto | null;
+};
+
+type ActiveAccessRequestDto = {
+  request_id: string;
+  status: AccessRequestLifecycle;
+  area_id: number;
+  direction: AccessDirection;
+};
+
+type AccessRequestDto = {
+  request_id: string;
+  status: AccessRequestLifecycle;
+  area_id: number;
+  direction: AccessDirection;
+  created_at: string;
+  expires_at: string | null;
+};
+
+type AccessRequestAcceptedDto = AccessRequestDto & {
+  expires_at: string;
+};
+
+type AccessRequestStatusDto = AccessRequestDto & {
+  updated_at: string;
+  user: { user_id: number; name: string } | null;
+  reason_code: AccessReasonCode | null;
+  message: string | null;
 };
 
 type UserDto = {
@@ -68,13 +104,20 @@ type ErrorResponseDto = {
   detail?: unknown;
 };
 
+type StructuredErrorDetailDto = {
+  reason_code?: unknown;
+  message?: unknown;
+};
+
 export class ApiError extends Error {
   status?: number;
+  reasonCode?: AccessReasonCode;
 
-  constructor(message: string, status?: number) {
+  constructor(message: string, status?: number, reasonCode?: AccessReasonCode) {
     super(message);
     this.name = 'ApiError';
     this.status = status;
+    this.reasonCode = reasonCode;
   }
 }
 
@@ -90,18 +133,44 @@ function getApiBaseUrl(): string {
   return apiBaseUrl;
 }
 
-function getErrorDetail(body: ErrorResponseDto): string | null {
-  return typeof body.detail === 'string' ? body.detail : null;
+function parseErrorDetail(body: ErrorResponseDto): {
+  message: string | null;
+  reasonCode?: AccessReasonCode;
+} {
+  if (typeof body.detail === 'string') {
+    return { message: body.detail };
+  }
+
+  if (body.detail && typeof body.detail === 'object') {
+    const detail = body.detail as StructuredErrorDetailDto;
+    return {
+      message: typeof detail.message === 'string' ? detail.message : null,
+      reasonCode:
+        typeof detail.reason_code === 'string'
+          ? (detail.reason_code as AccessReasonCode)
+          : undefined,
+    };
+  }
+
+  return { message: null };
 }
 
-async function request<T>(path: string): Promise<T> {
+async function request<T>(
+  path: string,
+  options: { method?: 'GET' | 'POST'; body?: object } = {},
+): Promise<T> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), requestTimeoutMs);
   let response: Response;
 
   try {
     response = await fetch(`${getApiBaseUrl()}${path}`, {
-      headers: { Accept: 'application/json' },
+      method: options.method ?? 'GET',
+      headers: {
+        Accept: 'application/json',
+        ...(options.body ? { 'Content-Type': 'application/json' } : {}),
+      },
+      body: options.body ? JSON.stringify(options.body) : undefined,
       signal: controller.signal,
     });
   } catch (error) {
@@ -115,15 +184,19 @@ async function request<T>(path: string): Promise<T> {
   }
 
   if (!response.ok) {
-    let detail: string | null = null;
+    let detail: ReturnType<typeof parseErrorDetail> = { message: null };
 
     try {
-      detail = getErrorDetail((await response.json()) as ErrorResponseDto);
+      detail = parseErrorDetail((await response.json()) as ErrorResponseDto);
     } catch {
       // The status code still provides a clear error if the body is not JSON.
     }
 
-    throw new ApiError(detail ?? `Smart Office backend returned HTTP ${response.status}.`, response.status);
+    throw new ApiError(
+      detail.message ?? `Smart Office backend returned HTTP ${response.status}.`,
+      response.status,
+      detail.reasonCode,
+    );
   }
 
   return (await response.json()) as T;
@@ -168,6 +241,52 @@ export async function getSystemState(): Promise<SmartOfficeSystemState> {
     esp32Online: state.esp32_online,
     esp32LastSeenAt: state.esp32_last_seen_at,
     lastUpdatedAt: state.last_updated_at,
+    personDetected: state.person_detected,
+    distanceCm: state.distance_cm,
+    fingerprintReady: state.fingerprint_ready,
+    activeAccessRequest: state.active_access_request
+      ? {
+          requestId: state.active_access_request.request_id,
+          status: state.active_access_request.status,
+          areaId: state.active_access_request.area_id,
+          direction: state.active_access_request.direction,
+        }
+      : null,
+  };
+}
+
+function mapAccessRequest(requestData: AccessRequestDto): AccessRequest {
+  return {
+    requestId: requestData.request_id,
+    status: requestData.status,
+    areaId: requestData.area_id,
+    direction: requestData.direction,
+    createdAt: requestData.created_at,
+    expiresAt: requestData.expires_at,
+  };
+}
+
+export async function createAccessRequest(
+  areaId: number,
+  direction: AccessDirection,
+): Promise<AccessRequest> {
+  const response = await request<AccessRequestAcceptedDto>('/api/access/requests', {
+    method: 'POST',
+    body: { area_id: areaId, direction },
+  });
+  return mapAccessRequest(response);
+}
+
+export async function getAccessRequest(requestId: string): Promise<AccessRequestResult> {
+  const response = await request<AccessRequestStatusDto>(
+    `/api/access/requests/${encodeURIComponent(requestId)}`,
+  );
+  return {
+    ...mapAccessRequest(response),
+    updatedAt: response.updated_at,
+    user: response.user ? { id: response.user.user_id, name: response.user.name } : null,
+    reasonCode: response.reason_code,
+    message: response.message,
   };
 }
 
