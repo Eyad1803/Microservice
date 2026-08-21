@@ -383,7 +383,10 @@ enum RemoteFingerprintWorkflowState {
   REMOTE_FINGERPRINT_SEARCHING,
   REMOTE_ACCESS_CHECK_READY,
   REMOTE_ACCESS_CHECK_STATUS,
-  REMOTE_AUTHORIZED_WAITING_DOOR
+  REMOTE_AUTHORIZED_WAITING_DOOR,
+  REMOTE_OPENING_DOOR,
+  REMOTE_WAITING_FOR_COMPLETE_ACK,
+  REMOTE_COMPLETION_RECONCILIATION_REQUIRED
 };
 
 enum RemoteFingerprintSensorOutcome {
@@ -415,6 +418,10 @@ struct RemoteAccessRequestState {
   int fingerprintConfidence;
   String accessCheckPayload;
   unsigned long lastAccessCheckAttemptAt;
+  bool liveAuthorizationReceived;
+  bool doorOpenCommandIssued;
+  String completionPayload;
+  unsigned long lastCompletionAttemptAt;
 };
 
 constexpr unsigned long WIFI_CONNECTION_ATTEMPT_TIMEOUT_MS = 15000;
@@ -422,6 +429,7 @@ constexpr unsigned long WIFI_RETRY_DELAY_MS = 5000;
 constexpr unsigned long HEARTBEAT_INTERVAL_MS = 2000;
 constexpr unsigned long REMOTE_REQUEST_STATUS_INTERVAL_MS = 2000;
 constexpr unsigned long ACCESS_CHECK_RETRY_INTERVAL_MS = 2000;
+constexpr unsigned long COMPLETION_RETRY_INTERVAL_MS = 2000;
 constexpr unsigned long BACKEND_RETRY_INTERVAL_MS = 5000;
 constexpr unsigned long BACKEND_FAILURE_LOG_INTERVAL_MS = 15000;
 constexpr uint16_t HTTP_CONNECT_TIMEOUT_MS = 1000;
@@ -502,6 +510,7 @@ RemoteCommandDecision evaluateRemoteCommand(
 void handleRemoteCommand(JsonObject command);
 void resetRemoteAccessRequestState();
 void serviceRemoteFingerprintWorkflow();
+void serviceRemoteDoorCompletionWorkflow();
 bool shouldStartRemoteFingerprintScan(AccessMode direction,
                                       bool locked,
                                       bool isDoorOpen,
@@ -517,6 +526,22 @@ void prepareRemoteAccessCheckPayload(const String& fingerprintResult,
                                      int fingerprintId = -1,
                                      int confidence = -1);
 bool handleRemoteAccessCheckResponse(const String& responseBody);
+bool canOpenRemoteDoorForState(RemoteFingerprintWorkflowState state,
+                               bool active,
+                               bool liveAuthorizationReceived,
+                               bool pendingRequestMatches,
+                               bool servoReady,
+                               bool isDoorOpen,
+                               bool locked);
+bool canSendRemoteCompletionForState(
+    RemoteFingerprintWorkflowState state,
+    bool active,
+    bool liveAuthorizationReceived,
+    bool doorOpenCommandIssued,
+    bool completionPayloadReady);
+void prepareRemoteCompletionPayload();
+bool handleRemoteCompletionResponse(const String& responseBody);
+void enterRemoteCompletionReconciliation(const String& reason);
 String getRemoteFingerprintWorkflowName(
     RemoteFingerprintWorkflowState state);
 void serviceRemoteRequestStatus();
@@ -575,6 +600,7 @@ void printSecurityStatus();
 void setupDoorServo();
 void setupUltrasonicSensor();
 void openDoor(String reason);
+void openDoor(String reason, Area area, AccessMode accessMode);
 void closeDoor(String reason);
 void updateDoorState();
 bool shouldCloseDoor();
@@ -1150,6 +1176,7 @@ void serviceNetworkIntegration() {
   }
   serviceRemoteRequestStatus();
   serviceRemoteFingerprintWorkflow();
+  serviceRemoteDoorCompletionWorkflow();
 }
 
 bool postJson(const char* path,
@@ -1228,6 +1255,10 @@ void resetRemoteAccessRequestState() {
   remoteAccessRequest.fingerprintConfidence = -1;
   remoteAccessRequest.accessCheckPayload = "";
   remoteAccessRequest.lastAccessCheckAttemptAt = 0;
+  remoteAccessRequest.liveAuthorizationReceived = false;
+  remoteAccessRequest.doorOpenCommandIssued = false;
+  remoteAccessRequest.completionPayload = "";
+  remoteAccessRequest.lastCompletionAttemptAt = 0;
 }
 
 bool parseRemoteDirection(const String& value, AccessMode& direction) {
@@ -1349,6 +1380,10 @@ void handleRemoteCommand(JsonObject command) {
   remoteAccessRequest.fingerprintConfidence = -1;
   remoteAccessRequest.accessCheckPayload = "";
   remoteAccessRequest.lastAccessCheckAttemptAt = 0;
+  remoteAccessRequest.liveAuthorizationReceived = false;
+  remoteAccessRequest.doorOpenCommandIssued = false;
+  remoteAccessRequest.completionPayload = "";
+  remoteAccessRequest.lastCompletionAttemptAt = 0;
   if (remoteAccessRequest.createdBySerial) {
     serialCreatedRequestId = "";
     serialCreatedRequestArea = AREA_NONE;
@@ -1367,8 +1402,8 @@ void handleRemoteCommand(JsonObject command) {
   Serial.println(getAreaName(remoteAccessRequest.area));
   Serial.print("[ACCESS] Direction: ");
   Serial.println(getAccessModeName(remoteAccessRequest.direction));
-  Serial.println("[ACCESS] Starting Phase 6 physical precheck");
-  Serial.println("[ACCESS] Door control remains disabled until Phase 7.");
+  Serial.println("[ACCESS] Starting physical precheck and fingerprint workflow");
+  Serial.println("[ACCESS] Door opens only after live Backend authorization.");
   Serial.println();
 }
 
@@ -1428,7 +1463,13 @@ String getRemoteFingerprintWorkflowName(
     case REMOTE_ACCESS_CHECK_STATUS:
       return "CHECKING_REQUEST_STATUS";
     case REMOTE_AUTHORIZED_WAITING_DOOR:
-      return "AUTHORIZED_WAITING_FOR_PHASE7_DOOR";
+      return "AUTHORIZED_WAITING_FOR_DOOR";
+    case REMOTE_OPENING_DOOR:
+      return "OPENING_DOOR";
+    case REMOTE_WAITING_FOR_COMPLETE_ACK:
+      return "WAITING_FOR_COMPLETE_ACK";
+    case REMOTE_COMPLETION_RECONCILIATION_REQUIRED:
+      return "COMPLETION_RECONCILIATION_REQUIRED";
     default:
       return "UNKNOWN";
   }
@@ -1529,6 +1570,12 @@ bool handleRemoteAccessCheckResponse(const String& responseBody) {
     return false;
   }
 
+  if (status == "AUTHORIZED_WAITING_DOOR" &&
+      reasonCode != "AUTHORIZED") {
+    Serial.println("[ACCESS CHECK] Inconsistent authorization response ignored; exact payload retained.");
+    return false;
+  }
+
   mirrorCanonicalSecurity(canonicalFailedAttempts, canonicalLockdown);
   Serial.println();
   Serial.println("[ACCESS CHECK RESPONSE]");
@@ -1552,10 +1599,11 @@ bool handleRemoteAccessCheckResponse(const String& responseBody) {
   }
 
   pendingAuthorizationId = responseRequestId;
+  remoteAccessRequest.liveAuthorizationReceived = true;
   remoteAccessRequest.workflowState = REMOTE_AUTHORIZED_WAITING_DOOR;
   setIntegrationSyncState(INTEGRATION_RECONCILIATION_REQUIRED);
   lcdShowMessage("AUTHORIZED", "WAIT FOR DOOR");
-  Serial.println("Door remains CLOSED. Phase 7 completion is not implemented.");
+  Serial.println("Live authorization confirmed for the current RAM request.");
   Serial.println();
   return true;
 }
@@ -1736,6 +1784,248 @@ void serviceRemoteFingerprintWorkflow() {
   Serial.print("[ACCESS CHECK] Backend returned HTTP ");
   Serial.print(responseCode);
   Serial.println("; exact payload retained for retry.");
+}
+
+bool canOpenRemoteDoorForState(RemoteFingerprintWorkflowState state,
+                               bool active,
+                               bool liveAuthorizationReceived,
+                               bool pendingRequestMatches,
+                               bool servoReady,
+                               bool isDoorOpen,
+                               bool locked) {
+  return state == REMOTE_AUTHORIZED_WAITING_DOOR && active &&
+         liveAuthorizationReceived && pendingRequestMatches && servoReady &&
+         !isDoorOpen && !locked;
+}
+
+bool canSendRemoteCompletionForState(
+    RemoteFingerprintWorkflowState state,
+    bool active,
+    bool liveAuthorizationReceived,
+    bool doorOpenCommandIssued,
+    bool completionPayloadReady) {
+  return state == REMOTE_WAITING_FOR_COMPLETE_ACK && active &&
+         liveAuthorizationReceived && doorOpenCommandIssued &&
+         completionPayloadReady;
+}
+
+void prepareRemoteCompletionPayload() {
+  if (!remoteAccessRequest.active ||
+      !remoteAccessRequest.doorOpenCommandIssued ||
+      remoteAccessRequest.completionPayload.length() > 0) {
+    return;
+  }
+
+  JsonDocument payload;
+  payload["request_id"] = remoteAccessRequest.requestId;
+  payload["door_result"] = "DOOR_OPENED";
+  serializeJson(payload, remoteAccessRequest.completionPayload);
+  remoteAccessRequest.workflowState = REMOTE_WAITING_FOR_COMPLETE_ACK;
+  remoteAccessRequest.lastCompletionAttemptAt = 0;
+  Serial.println("[ACCESS COMPLETE] Exact DOOR_OPENED payload retained for retry.");
+}
+
+void enterRemoteCompletionReconciliation(const String& reason) {
+  if (!remoteAccessRequest.active) {
+    return;
+  }
+  remoteAccessRequest.workflowState =
+      REMOTE_COMPLETION_RECONCILIATION_REQUIRED;
+  setIntegrationSyncState(INTEGRATION_RECONCILIATION_REQUIRED);
+  Serial.println();
+  Serial.println("[HIGH SEVERITY RECONCILIATION REQUIRED]");
+  Serial.print("Request: ");
+  Serial.println(remoteAccessRequest.requestId);
+  Serial.print("Reason: ");
+  Serial.println(reason);
+  Serial.println("Pending authorization and RAM request are preserved.");
+  Serial.println("The local door lifecycle remains active and safe.");
+  Serial.println();
+  lcdShowMessage("RECONCILIATION", "CHECK DOOR/API");
+}
+
+bool handleRemoteCompletionResponse(const String& responseBody) {
+  JsonDocument response;
+  DeserializationError jsonError = deserializeJson(response, responseBody);
+  bool valid = !jsonError &&
+               response["request_id"].is<const char*>() &&
+               response["status"].is<const char*>() &&
+               response["reason_code"].is<const char*>() &&
+               response["message"].is<const char*>() &&
+               response["failed_attempts"].is<int>() &&
+               response["lockdown_active"].is<bool>();
+  if (!valid) {
+    Serial.println("[ACCESS COMPLETE] Invalid response; exact payload retained for retry.");
+    return false;
+  }
+
+  String responseRequestId = response["request_id"].as<const char*>();
+  String status = response["status"].as<const char*>();
+  String reasonCode = response["reason_code"].as<const char*>();
+  String message = response["message"].as<const char*>();
+  int canonicalFailedAttempts = response["failed_attempts"].as<int>();
+  bool canonicalLockdown = response["lockdown_active"].as<bool>();
+  if (responseRequestId != remoteAccessRequest.requestId ||
+      canonicalFailedAttempts < 0 ||
+      canonicalFailedAttempts > MAX_FAILED_ATTEMPTS) {
+    Serial.println("[ACCESS COMPLETE] Mismatched response; exact payload retained for retry.");
+    return false;
+  }
+
+  if (status != "GRANTED" || reasonCode != "AUTHORIZED") {
+    enterRemoteCompletionReconciliation(
+        "Unexpected completion outcome " + status + " / " + reasonCode);
+    return false;
+  }
+
+  Area completedArea = remoteAccessRequest.area;
+  AccessMode completedDirection = remoteAccessRequest.direction;
+  mirrorCanonicalSecurity(canonicalFailedAttempts, canonicalLockdown);
+
+  Serial.println();
+  Serial.println(completedDirection == MODE_EXIT ? "[EXIT GRANTED]"
+                                                  : "[ENTRY GRANTED]");
+  Serial.print("Request: ");
+  Serial.println(responseRequestId);
+  Serial.print("Area: ");
+  Serial.println(getAreaName(completedArea));
+  Serial.print("Backend: ");
+  Serial.print(status);
+  Serial.print(" - ");
+  Serial.println(message);
+  Serial.println("Attendance and AccessLog were committed by Backend.");
+  Serial.println("No local attendance mutation was performed.");
+
+  pendingAuthorizationId = "";
+  if (completedDirection == MODE_EXIT) {
+    lcdShowMessage("EXIT GRANTED", "BACKEND CONFIRMED");
+  } else {
+    lcdShowMessage("ACCESS GRANTED", "BACKEND CONFIRMED");
+  }
+  triggerAccessGrantedFeedback();
+  clearTrackedRemoteRequest(responseRequestId, "GRANTED");
+
+  // Completion responses do not carry the full attendance matrix. Force a
+  // canonical bootstrap refresh instead of mutating the local mirror.
+  lastBackendSyncAttemptAt = 0;
+  setIntegrationSyncState(INTEGRATION_UNSYNCED);
+  return true;
+}
+
+void serviceRemoteDoorCompletionWorkflow() {
+  if (!remoteAccessRequest.active) {
+    return;
+  }
+
+  RemoteFingerprintWorkflowState state =
+      remoteAccessRequest.workflowState;
+  if (state == REMOTE_AUTHORIZED_WAITING_DOOR) {
+    bool pendingMatches = pendingAuthorizationId.length() > 0 &&
+                          pendingAuthorizationId ==
+                              remoteAccessRequest.requestId;
+    bool mayOpen = canOpenRemoteDoorForState(
+        state,
+        remoteAccessRequest.active,
+        remoteAccessRequest.liveAuthorizationReceived,
+        pendingMatches,
+        servoInitialized,
+        doorOpen,
+        systemLocked);
+    if (!mayOpen) {
+      String reason = "Live authorization door preconditions failed";
+      if (!remoteAccessRequest.liveAuthorizationReceived) {
+        reason = "Authorization was discovered by status/bootstrap, not received live";
+      } else if (!pendingMatches) {
+        reason = "Pending authorization does not match the active request";
+      } else if (!servoInitialized) {
+        reason = "DOOR HARDWARE ERROR: servo is not initialized";
+      } else if (doorOpen) {
+        reason = "Door was already open before this authorization";
+      } else if (systemLocked) {
+        reason = "System entered Lockdown before door opening";
+      }
+      enterRemoteCompletionReconciliation(reason);
+      return;
+    }
+
+    remoteAccessRequest.workflowState = REMOTE_OPENING_DOOR;
+    Serial.println();
+    Serial.println("[DOOR] Backend authorization confirmed");
+    Serial.print("[DOOR] Opening for request: ");
+    Serial.println(remoteAccessRequest.requestId);
+    Serial.print("[DOOR] Area: ");
+    Serial.println(getAreaName(remoteAccessRequest.area));
+    Serial.print("[DOOR] Direction: ");
+    Serial.println(getAccessModeName(remoteAccessRequest.direction));
+    openDoor("Live Backend authorization",
+             remoteAccessRequest.area,
+             remoteAccessRequest.direction);
+    if (!doorOpen) {
+      enterRemoteCompletionReconciliation(
+          "DOOR HARDWARE ERROR: software OPEN state was not reached");
+      return;
+    }
+
+    remoteAccessRequest.doorOpenCommandIssued = true;
+    prepareRemoteCompletionPayload();
+    return;
+  }
+
+  bool completionReady = canSendRemoteCompletionForState(
+      state,
+      remoteAccessRequest.active,
+      remoteAccessRequest.liveAuthorizationReceived,
+      remoteAccessRequest.doorOpenCommandIssued,
+      remoteAccessRequest.completionPayload.length() > 0);
+  if (!completionReady) {
+    return;
+  }
+
+  bool canonicalRequestReachable =
+      integrationSyncState == INTEGRATION_SYNCED ||
+      (integrationSyncState == INTEGRATION_RECONCILIATION_REQUIRED &&
+       pendingAuthorizationId == remoteAccessRequest.requestId);
+  if (!canonicalRequestReachable || !backendReachable ||
+      WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+
+  unsigned long now = millis();
+  if (remoteAccessRequest.lastCompletionAttemptAt != 0 &&
+      now - remoteAccessRequest.lastCompletionAttemptAt <
+          COMPLETION_RETRY_INTERVAL_MS) {
+    return;
+  }
+  remoteAccessRequest.lastCompletionAttemptAt = now;
+
+  String responseBody;
+  int responseCode = -1;
+  bool completed = postJson("/api/access/complete",
+                            remoteAccessRequest.completionPayload,
+                            responseBody,
+                            responseCode,
+                            HTTP_CODE_OK);
+  if (completed) {
+    handleRemoteCompletionResponse(responseBody);
+    return;
+  }
+
+  if (responseCode < 0) {
+    markBackendUnavailable("Access completion", responseCode);
+    Serial.println("[ACCESS COMPLETE] Door was opened; exact payload retained for retry.");
+    return;
+  }
+  if (responseCode >= 500) {
+    Serial.print("[ACCESS COMPLETE] Backend HTTP ");
+    Serial.print(responseCode);
+    Serial.println("; exact payload retained for retry.");
+    return;
+  }
+
+  String rejection = getApiErrorDescription(responseBody);
+  enterRemoteCompletionReconciliation(
+      "Completion rejected after door OPEN (HTTP " +
+      String(responseCode) + "): " + rejection);
 }
 
 String getApiErrorDescription(const String& responseBody) {
@@ -1961,10 +2251,13 @@ void serviceRemoteRequestStatus() {
   if (status == "AUTHORIZED_WAITING_DOOR") {
     pendingAuthorizationId = trackedRequestId;
     if (remoteAccessRequest.active) {
-      remoteAccessRequest.workflowState = REMOTE_AUTHORIZED_WAITING_DOOR;
+      remoteAccessRequest.liveAuthorizationReceived = false;
+      remoteAccessRequest.workflowState =
+          REMOTE_COMPLETION_RECONCILIATION_REQUIRED;
     }
     setIntegrationSyncState(INTEGRATION_RECONCILIATION_REQUIRED);
-    Serial.println("[ACCESS] Persistent authorization requires reconciliation; request preserved.");
+    Serial.println("[ACCESS] Authorization was discovered by status polling.");
+    Serial.println("[ACCESS] Door remains unchanged; reconciliation is required.");
     return;
   }
   if (status == "GRANTED" || status == "DENIED" ||
@@ -2070,8 +2363,10 @@ bool applyHeartbeatResponse(const String& responseBody) {
     pendingAuthorizationId = receivedPendingId;
     if (remoteAccessRequest.active &&
         remoteAccessRequest.requestId == receivedPendingId &&
-        remoteAccessRequest.workflowState != REMOTE_ACCESS_CHECK_READY) {
-      remoteAccessRequest.workflowState = REMOTE_AUTHORIZED_WAITING_DOOR;
+        remoteAccessRequest.workflowState != REMOTE_ACCESS_CHECK_READY &&
+        !remoteAccessRequest.liveAuthorizationReceived) {
+      remoteAccessRequest.workflowState =
+          REMOTE_COMPLETION_RECONCILIATION_REQUIRED;
     }
     setIntegrationSyncState(INTEGRATION_RECONCILIATION_REQUIRED);
   }
@@ -2248,8 +2543,10 @@ bool applyBootstrapResponse(const String& responseBody) {
     pendingAuthorizationId = receivedPendingId;
     if (remoteAccessRequest.active &&
         remoteAccessRequest.requestId == receivedPendingId &&
-        remoteAccessRequest.workflowState != REMOTE_ACCESS_CHECK_READY) {
-      remoteAccessRequest.workflowState = REMOTE_AUTHORIZED_WAITING_DOOR;
+        remoteAccessRequest.workflowState != REMOTE_ACCESS_CHECK_READY &&
+        !remoteAccessRequest.liveAuthorizationReceived) {
+      remoteAccessRequest.workflowState =
+          REMOTE_COMPLETION_RECONCILIATION_REQUIRED;
     }
     setIntegrationSyncState(INTEGRATION_RECONCILIATION_REQUIRED);
     Serial.println("[BACKEND] Bootstrap found a persistent pending authorization.");
@@ -2264,8 +2561,15 @@ bool applyBootstrapResponse(const String& responseBody) {
     Serial.println("[BACKEND] Door remains unchanged; manual/NVS reconciliation is required.");
   } else {
     pendingAuthorizationId = "";
-    setIntegrationSyncState(INTEGRATION_SYNCED);
-    Serial.println("[BACKEND] Bootstrap succeeded: 42 attendance mirrors loaded.");
+    if (remoteAccessRequest.active &&
+        remoteAccessRequest.workflowState ==
+            REMOTE_COMPLETION_RECONCILIATION_REQUIRED) {
+      setIntegrationSyncState(INTEGRATION_RECONCILIATION_REQUIRED);
+      Serial.println("[BACKEND] Attendance mirrors loaded; local door transaction still requires reconciliation.");
+    } else {
+      setIntegrationSyncState(INTEGRATION_SYNCED);
+      Serial.println("[BACKEND] Bootstrap succeeded: 42 attendance mirrors loaded.");
+    }
   }
   return true;
 }
@@ -2669,6 +2973,10 @@ void setupUltrasonicSensor() {
 }
 
 void openDoor(String reason) {
+  openDoor(reason, selectedArea, currentMode);
+}
+
+void openDoor(String reason, Area area, AccessMode accessMode) {
   if (isSystemLocked()) {
     Serial.println("[DOOR BLOCKED]");
     Serial.println("System is locked. Door remains closed.");
@@ -2699,13 +3007,13 @@ void openDoor(String reason) {
   Serial.print("Reason: ");
   Serial.println(reason);
   Serial.print("Selected Area: ");
-  Serial.println(getAreaName(selectedArea));
+  Serial.println(getAreaName(area));
   Serial.print("Mode: ");
-  Serial.println(getAccessModeName(currentMode));
+  Serial.println(getAccessModeName(accessMode));
   Serial.print("Servo Angle: ");
   Serial.println(DOOR_OPEN_ANGLE);
 
-  lcdShowDoorOpen(currentMode == MODE_EXIT);
+  lcdShowDoorOpen(accessMode == MODE_EXIT);
 }
 
 void closeDoor(String reason) {
@@ -4453,6 +4761,150 @@ void runSoftwareValidation() {
                timeoutPayload["confidence"].isNull(),
            "TIMEOUT without fingerprint_id or confidence",
            "non-MATCH payload exposed identity fields");
+
+  validate("Phase 7 door cannot open before live authorization",
+           !canOpenRemoteDoorForState(
+               REMOTE_ACCESS_CHECK_READY,
+               true,
+               false,
+               true,
+               true,
+               false,
+               false),
+           "door blocked",
+           "door opening was allowed before authorization");
+  validate("Phase 7 current-boot live authorization may open",
+           canOpenRemoteDoorForState(
+               REMOTE_AUTHORIZED_WAITING_DOOR,
+               true,
+               true,
+               true,
+               true,
+               false,
+               false),
+           "door allowed",
+           "valid live authorization was blocked");
+  validate("Phase 7 bootstrap-only pending cannot auto-open",
+           !canOpenRemoteDoorForState(
+               REMOTE_AUTHORIZED_WAITING_DOOR,
+               true,
+               false,
+               true,
+               true,
+               false,
+               false),
+           "door blocked",
+           "bootstrap-only authorization could open door");
+  validate("Phase 7 unsafe door conditions fail closed",
+           !canOpenRemoteDoorForState(
+               REMOTE_AUTHORIZED_WAITING_DOOR,
+               true,
+               true,
+               false,
+               true,
+               false,
+               false) &&
+               !canOpenRemoteDoorForState(
+                   REMOTE_AUTHORIZED_WAITING_DOOR,
+                   true,
+                   true,
+                   true,
+                   false,
+                   false,
+                   false) &&
+               !canOpenRemoteDoorForState(
+                   REMOTE_AUTHORIZED_WAITING_DOOR,
+                   true,
+                   true,
+                   true,
+                   true,
+                   true,
+                   false) &&
+               !canOpenRemoteDoorForState(
+                   REMOTE_AUTHORIZED_WAITING_DOOR,
+                   true,
+                   true,
+                   true,
+                   true,
+                   false,
+                   true),
+           "mismatch, servo failure, open door and Lockdown blocked",
+           "at least one unsafe condition allowed opening");
+  validate("Phase 7 completion cannot send before software OPEN",
+           !canSendRemoteCompletionForState(
+               REMOTE_AUTHORIZED_WAITING_DOOR,
+               true,
+               true,
+               false,
+               false),
+           "completion blocked",
+           "completion allowed before door OPEN");
+
+  resetRemoteAccessRequestState();
+  remoteAccessRequest.active = true;
+  remoteAccessRequest.requestId = "validation_phase7_complete";
+  remoteAccessRequest.area = COMPANY_A;
+  remoteAccessRequest.direction = MODE_ENTRY;
+  remoteAccessRequest.workflowState = REMOTE_OPENING_DOOR;
+  remoteAccessRequest.liveAuthorizationReceived = true;
+  remoteAccessRequest.doorOpenCommandIssued = true;
+  prepareRemoteCompletionPayload();
+  JsonDocument completionPayload;
+  DeserializationError completionPayloadError = deserializeJson(
+      completionPayload, remoteAccessRequest.completionPayload);
+  validate("Phase 7 completion payload uses exact canonical request",
+           !completionPayloadError &&
+               completionPayload["request_id"] ==
+                   "validation_phase7_complete" &&
+               completionPayload["door_result"] == "DOOR_OPENED",
+           "exact request ID and DOOR_OPENED",
+           "completion payload mismatch");
+
+  String immutableCompletionPayload =
+      remoteAccessRequest.completionPayload;
+  prepareRemoteCompletionPayload();
+  validate("Phase 7 completion retry payload is immutable",
+           remoteAccessRequest.completionPayload ==
+               immutableCompletionPayload,
+           "byte-for-byte identical payload",
+           "completion payload changed before retry");
+  validate("Phase 7 opened transaction is eligible for completion retry",
+           canSendRemoteCompletionForState(
+               remoteAccessRequest.workflowState,
+               remoteAccessRequest.active,
+               remoteAccessRequest.liveAuthorizationReceived,
+               remoteAccessRequest.doorOpenCommandIssued,
+               remoteAccessRequest.completionPayload.length() > 0),
+           "same completion remains eligible",
+           "completion retry was blocked");
+  validate("Phase 7 completion retry cannot reopen servo",
+           !canOpenRemoteDoorForState(
+               remoteAccessRequest.workflowState,
+               remoteAccessRequest.active,
+               remoteAccessRequest.liveAuthorizationReceived,
+               true,
+               true,
+               false,
+               false),
+           "door opening disabled after first OPEN",
+           "completion retry could reopen door");
+  validate("Phase 7 reconciliation state blocks automatic actions",
+           !canOpenRemoteDoorForState(
+               REMOTE_COMPLETION_RECONCILIATION_REQUIRED,
+               true,
+               true,
+               true,
+               true,
+               false,
+               false) &&
+               !canSendRemoteCompletionForState(
+                   REMOTE_COMPLETION_RECONCILIATION_REQUIRED,
+                   true,
+                   true,
+                   true,
+                   true),
+           "door and completion blocked",
+           "automatic action allowed during reconciliation");
 
   restoreAccessControlState(remoteCommandAccessState);
   fingerprintReady = remoteCommandFingerprintReady;
