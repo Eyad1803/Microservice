@@ -44,6 +44,13 @@ export default function TabLayout() {
         }}
       />
       <Tabs.Screen
+        name="access"
+        options={{
+          title: 'Access',
+          tabBarIcon: ({ color }) => <IconSymbol size={25} name="key.fill" color={color} />,
+        }}
+      />
+      <Tabs.Screen
         name="areas"
         options={{
           title: 'Areas',

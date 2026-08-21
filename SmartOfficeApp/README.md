@@ -7,8 +7,11 @@ React Native application for the Smart Office Building Access System, built with
 - Dashboard
 - Users
 - User details
+- Access
 - Areas
 - Access logs
+
+The bottom tabs remain ordered as `Dashboard → Users → Access → Areas → Logs`.
 
 All live screen data comes from the FastAPI REST API. `data/mockData.ts` is retained only as historical development data and is not imported by the running application. The app does not fall back to mock data when the backend is unavailable.
 

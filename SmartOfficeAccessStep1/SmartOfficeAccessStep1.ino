@@ -13,6 +13,10 @@
 #define FINGERPRINT_EXPECTED_VOLTAGE "3.3V"
 #define FINGERPRINT_EXPECTED_CURRENT_MA 60
 
+#if FINGERPRINT_ONLY_DEBUG && SERVO_ONLY_DEBUG
+#error "Enable only one hardware isolation mode at a time."
+#endif
+
 #if FINGERPRINT_ONLY_DEBUG
 
 // Exact copy of the known-working standalone Fingerprint.ino. The complete
@@ -110,10 +114,6 @@ void loop() {
 #include <LiquidCrystal_I2C.h>
 #include <ESP32Servo.h>
 
-#if FINGERPRINT_ONLY_DEBUG && SERVO_ONLY_DEBUG
-#error "Enable only one hardware isolation mode at a time."
-#endif
-
 /*
   POWER WARNING:
   - Power the ESP32 from USB during development.
@@ -184,6 +184,9 @@ constexpr uint8_t LCD_SCL_PIN = 27;
 constexpr uint32_t FINGERPRINT_PRIMARY_BAUD = 57600;
 constexpr uint32_t FINGERPRINT_FALLBACK_BAUD_RATES[] = {9600, 19200, 38400};
 constexpr uint32_t FINGERPRINT_CAPTURE_TIMEOUT_MS = 15000;
+constexpr uint16_t FINGERPRINT_DELETE_IDS[] = {1, 2, 3, 4, 5, 6};
+constexpr size_t FINGERPRINT_DELETE_ID_COUNT =
+    sizeof(FINGERPRINT_DELETE_IDS) / sizeof(FINGERPRINT_DELETE_IDS[0]);
 
 constexpr int FINGERPRINT_NOT_RECOGNIZED = -1;
 constexpr int FINGERPRINT_CAPTURE_TIMEOUT = -2;
@@ -194,18 +197,43 @@ const String ADMIN_RFID_PLACEHOLDER = "PUT_ADMIN_CARD_UID_HERE";
 
 enum Area {
   AREA_NONE = 0,
-  MAIN_ENTRANCE = 1,
-  COMPANY_A = 2,
-  COMPANY_B = 3,
-  SERVER_ROOM = 4,
-  MANAGEMENT_ADMIN = 5,
-  COMPANY_C = 6,
-  COMPANY_D = 7
+  COMPANY_A = 1,
+  COMPANY_B = 2,
+  COMPANY_C = 3,
+  COMPANY_D = 4,
+  SERVER_ROOM = 5,
+  MANAGEMENT_ADMIN = 6,
+  MAIN_ENTRANCE = 7
 };
 
 enum AccessMode {
   MODE_ENTRY,
   MODE_EXIT
+};
+
+enum AccessPrecheckResult {
+  ACCESS_PRECHECK_OK,
+  ACCESS_PRECHECK_LOCKED,
+  ACCESS_PRECHECK_NO_AREA,
+  ACCESS_PRECHECK_DOOR_OPEN,
+  ACCESS_PRECHECK_ULTRASONIC_INVALID,
+  ACCESS_PRECHECK_PERSON_NOT_NEAR,
+  ACCESS_PRECHECK_FINGERPRINT_UNAVAILABLE
+};
+
+enum FingerprintDeleteGateResult {
+  FINGERPRINT_DELETE_ALLOWED,
+  FINGERPRINT_DELETE_BLOCKED_LOCKDOWN,
+  FINGERPRINT_DELETE_BLOCKED_SENSOR,
+  FINGERPRINT_DELETE_BLOCKED_ADMIN
+};
+
+enum FingerprintDeleteConfirmationResult {
+  FINGERPRINT_DELETE_CONFIRMED,
+  FINGERPRINT_DELETE_CANCELLED_TEXT,
+  FINGERPRINT_DELETE_CANCELLED_LOCKDOWN,
+  FINGERPRINT_DELETE_CANCELLED_SENSOR,
+  FINGERPRINT_DELETE_CANCELLED_ADMIN
 };
 
 struct User {
@@ -226,10 +254,10 @@ struct User {
 User users[] = {
     {1, "Employee A", "Company A", "Employee", true, true, false, false, false, false, false, 0},
     {2, "Employee B", "Company B", "Employee", true, false, true, false, false, false, false, 0},
-    {3, "IT Admin", "IT", "IT", true, false, false, true, false, false, false, 0},
-    {4, "Manager", "Management", "Manager", true, true, true, true, true, true, true, 0},
-    {5, "Employee C", "Company C", "Employee", true, false, false, false, false, true, false, 0},
-    {6, "Employee D", "Company D", "Employee", true, false, false, false, false, false, true, 0}};
+    {3, "Employee C", "Company C", "Employee", true, false, false, false, false, true, false, 0},
+    {4, "Employee D", "Company D", "Employee", true, false, false, false, false, false, true, 0},
+    {5, "IT Admin", "IT", "IT", true, false, false, true, false, false, false, 0},
+    {6, "Manager", "Management", "Manager", true, true, true, true, true, true, true, 0}};
 
 constexpr size_t USER_COUNT = sizeof(users) / sizeof(users[0]);
 
@@ -241,6 +269,7 @@ struct AccessControlStateSnapshot {
   int failedAttempts;
   unsigned long adminModeStartTime;
   bool waitingForEnrollmentID;
+  bool waitingForDeleteConfirmation;
   bool doorOpen;
   unsigned long doorOpenedAt;
   bool presencePromptVisible;
@@ -262,6 +291,7 @@ bool fingerprintReady = false;
 uint32_t fingerprintWorkingBaud = 0;
 bool lcdInitialized = false;
 bool waitingForEnrollmentID = false;
+bool waitingForDeleteConfirmation = false;
 
 bool systemLocked = false;
 bool adminMode = false;
@@ -311,6 +341,8 @@ bool isAccessControlStateUnchanged(
 bool isLCDCacheUnchanged(const AccessControlStateSnapshot& snapshot);
 void restoreAccessControlState(const AccessControlStateSnapshot& snapshot);
 void restoreDiagnosticLCD(const AccessControlStateSnapshot& snapshot);
+void restoreWorkingFingerprintState(bool wasReady,
+                                    uint32_t savedBaud);
 bool isStateGuardedDiagnosticCommand(char command);
 void runStateGuardedDiagnostic(char command);
 bool validatePinAssignments();
@@ -359,9 +391,11 @@ void updateDoorState();
 bool shouldCloseDoor();
 bool shouldCloseDoorForState(bool isOpen,
                              unsigned long openElapsedMs,
+                             bool ultrasonicMeasurementValid,
                              bool personNear);
 float readDistanceCm();
 bool isPersonNear();
+bool isUltrasonicMeasurementValid(float distanceCm);
 bool isDistanceNear(float distanceCm);
 bool isPresenceRequiredForMode(AccessMode mode);
 void updateUltrasonicMeasurement(bool forceRead);
@@ -405,11 +439,38 @@ bool initializeFingerprintAtBaud(uint32_t baudRate);
 void printFingerprintParameters();
 void testSimpleFingerprintScan();
 bool enrollFingerprint(int id);
+FingerprintDeleteGateResult evaluateFingerprintDeleteGate(
+    bool locked,
+    bool sensorReady,
+    bool adminActive);
+FingerprintDeleteConfirmationResult evaluateFingerprintDeleteConfirmation(
+    const String& input,
+    bool locked,
+    bool sensorReady,
+    bool adminActive);
+bool configuredFingerprintDeleteIDsAreExactly1To6();
+bool isFingerprintSlotEmptyResult(uint8_t result);
+String getFingerprintDeleteError(uint8_t result);
+void requestConfiguredFingerprintDeletion();
+void handleFingerprintDeleteConfirmation(const String& input);
+void cancelFingerprintDeleteConfirmation(String reason);
+void deleteConfiguredFingerprints();
 int readFingerprintID();
 
 void handleSerialCommand();
 void handleAreaSelection(char command);
 void processSerialInput(String input);
+bool canEnableExitModeForState(bool locked,
+                               Area area,
+                               bool isDoorOpen);
+AccessPrecheckResult evaluateAccessPrecheck(
+    AccessMode mode,
+    bool locked,
+    Area area,
+    bool isDoorOpen,
+    bool ultrasonicMeasurementValid,
+    bool personNear,
+    bool fingerprintAvailable);
 
 String getAreaName(Area area);
 
@@ -890,6 +951,7 @@ void unlockSystem() {
 void applyLockedState() {
   systemLocked = true;
   waitingForEnrollmentID = false;
+  waitingForDeleteConfirmation = false;
   currentMode = MODE_ENTRY;
   presencePromptVisible = false;
   disableAdminMode();
@@ -925,10 +987,16 @@ void checkAdminModeTimeout() {
     return;
   }
 
+  bool deleteConfirmationWasPending = waitingForDeleteConfirmation;
   disableAdminMode();
   waitingForEnrollmentID = false;
+  waitingForDeleteConfirmation = false;
   Serial.println();
   Serial.println("[ADMIN MODE EXPIRED]");
+  if (deleteConfirmationWasPending) {
+    Serial.println("[FINGERPRINT DELETE CANCELLED]");
+    Serial.println("Reason: Admin Mode expired before confirmation.");
+  }
   Serial.println();
   lcdShowMessage("ADMIN EXPIRED", "SCAN ADMIN RFID");
 }
@@ -1152,13 +1220,19 @@ bool shouldCloseDoor() {
     return false;
   }
 
-  return shouldCloseDoorForState(doorOpen, openElapsedMs, isPersonNear());
+  updateUltrasonicMeasurement(false);
+  bool measurementValid = isUltrasonicMeasurementValid(lastDistanceCm);
+  bool personNear = isDistanceNear(lastDistanceCm);
+  return shouldCloseDoorForState(
+      doorOpen, openElapsedMs, measurementValid, personNear);
 }
 
 bool shouldCloseDoorForState(bool isOpen,
                              unsigned long openElapsedMs,
+                             bool ultrasonicMeasurementValid,
                              bool personNear) {
-  return isOpen && openElapsedMs >= DOOR_MIN_OPEN_TIME_MS && !personNear;
+  return isOpen && openElapsedMs >= DOOR_MIN_OPEN_TIME_MS &&
+         ultrasonicMeasurementValid && !personNear;
 }
 
 float readDistanceCm() {
@@ -1185,8 +1259,13 @@ bool isPersonNear() {
   return isDistanceNear(lastDistanceCm);
 }
 
+bool isUltrasonicMeasurementValid(float distanceCm) {
+  return distanceCm > 0.0;
+}
+
 bool isDistanceNear(float distanceCm) {
-  return distanceCm > 0.0 && distanceCm <= PRESENCE_DISTANCE_CM;
+  return isUltrasonicMeasurementValid(distanceCm) &&
+         distanceCm <= PRESENCE_DISTANCE_CM;
 }
 
 bool isPresenceRequiredForMode(AccessMode mode) {
@@ -1519,14 +1598,15 @@ String getLCDAreaName(Area area) {
 void printMenu() {
   Serial.println();
   Serial.println("Commands:");
-  Serial.println("1 = Main Entrance");
-  Serial.println("2 = Company A");
-  Serial.println("3 = Company B");
-  Serial.println("4 = Server Room");
-  Serial.println("5 = Management / Admin");
-  Serial.println("6 = Company C");
-  Serial.println("7 = Company D");
+  Serial.println("1 = Company A");
+  Serial.println("2 = Company B");
+  Serial.println("3 = Company C");
+  Serial.println("4 = Company D");
+  Serial.println("5 = Server Room");
+  Serial.println("6 = Management / Admin");
+  Serial.println("7 = Main Entrance");
   Serial.println("E = Enroll fingerprint (Admin Mode only)");
+  Serial.println("C = Delete configured fingerprints 1-6 (Admin Mode + confirmation)");
   Serial.println("R = Read/test fingerprint");
   Serial.println("F = Detect AS608/JM-101B at 3.3V using UART2");
   Serial.println("P = Simple fingerprint scan/match test");
@@ -1616,7 +1696,7 @@ void printHardwareSelfTest() {
   Serial.println(ULTRASONIC_TRIG_PIN);
   Serial.print("Ultrasonic ECHO: GPIO ");
   Serial.print(ULTRASONIC_ECHO_PIN);
-  Serial.println(" (input-only pin: correct)");
+  Serial.println(" (configured as input through voltage divider)");
   Serial.print("Pin Conflict Check: ");
   Serial.println(validatePinAssignments() ? "PASS" : "FAIL");
   Serial.println("Power Note: JM-101B uses 3.3V; servo uses separate 5V; common GND is required.");
@@ -1638,6 +1718,7 @@ AccessControlStateSnapshot captureAccessControlState() {
   snapshot.failedAttempts = failedAttempts;
   snapshot.adminModeStartTime = adminModeStartTime;
   snapshot.waitingForEnrollmentID = waitingForEnrollmentID;
+  snapshot.waitingForDeleteConfirmation = waitingForDeleteConfirmation;
   snapshot.doorOpen = doorOpen;
   snapshot.doorOpenedAt = doorOpenedAt;
   snapshot.presencePromptVisible = presencePromptVisible;
@@ -1659,6 +1740,8 @@ bool isAccessControlStateUnchanged(
                    failedAttempts == snapshot.failedAttempts &&
                    adminModeStartTime == snapshot.adminModeStartTime &&
                    waitingForEnrollmentID == snapshot.waitingForEnrollmentID &&
+                   waitingForDeleteConfirmation ==
+                       snapshot.waitingForDeleteConfirmation &&
                    doorOpen == snapshot.doorOpen &&
                    doorOpenedAt == snapshot.doorOpenedAt &&
                    presencePromptVisible == snapshot.presencePromptVisible;
@@ -1682,6 +1765,7 @@ void restoreAccessControlState(const AccessControlStateSnapshot& snapshot) {
   failedAttempts = snapshot.failedAttempts;
   adminModeStartTime = snapshot.adminModeStartTime;
   waitingForEnrollmentID = snapshot.waitingForEnrollmentID;
+  waitingForDeleteConfirmation = snapshot.waitingForDeleteConfirmation;
   doorOpen = snapshot.doorOpen;
   doorOpenedAt = snapshot.doorOpenedAt;
   presencePromptVisible = snapshot.presencePromptVisible;
@@ -1704,6 +1788,14 @@ void restoreDiagnosticLCD(const AccessControlStateSnapshot& snapshot) {
 bool isStateGuardedDiagnosticCommand(char command) {
   return command == 'F' || command == 'P' || command == 'D' ||
          command == 'U' || command == 'W';
+}
+
+void restoreWorkingFingerprintState(bool wasReady,
+                                    uint32_t savedBaud) {
+  if (wasReady && !fingerprintReady) {
+    fingerprintReady = true;
+    fingerprintWorkingBaud = savedBaud;
+  }
 }
 
 void runHardwareReadinessCheck() {
@@ -1770,6 +1862,8 @@ void runStateGuardedDiagnostic(char command) {
   }
 
   AccessControlStateSnapshot savedState = captureAccessControlState();
+  bool fingerprintWasReady = fingerprintReady;
+  uint32_t savedFingerprintBaud = fingerprintWorkingBaud;
   switch (command) {
     case 'F':
       runFingerprintStandaloneStyleTest();
@@ -1786,6 +1880,14 @@ void runStateGuardedDiagnostic(char command) {
     case 'W':
       runHardwareReadinessCheck();
       break;
+  }
+
+  // A temporary diagnostic communication failure must not disable a sensor
+  // that was already working before F, P, or W was run.
+  if (fingerprintWasReady && !fingerprintReady) {
+    restoreWorkingFingerprintState(
+        fingerprintWasReady, savedFingerprintBaud);
+    Serial.println("[DIAGNOSTIC STATE GUARD] Restored prior fingerprint-ready state.");
   }
 
   bool accessStateUnchanged = isAccessControlStateUnchanged(savedState);
@@ -1823,12 +1925,15 @@ void runSoftwareValidation() {
   Area savedSelectedArea = selectedArea;
   AccessMode savedCurrentMode = currentMode;
   bool savedWaitingForEnrollmentID = waitingForEnrollmentID;
+  bool savedWaitingForDeleteConfirmation = waitingForDeleteConfirmation;
   bool savedDoorOpen = doorOpen;
   unsigned long savedDoorOpenedAt = doorOpenedAt;
   float savedLastDistanceCm = lastDistanceCm;
   unsigned long savedLastUltrasonicCheckAt = lastUltrasonicCheckAt;
   bool savedUltrasonicHasMeasurement = ultrasonicHasMeasurement;
   bool savedPresencePromptVisible = presencePromptVisible;
+  bool savedFingerprintReady = fingerprintReady;
+  uint32_t savedFingerprintWorkingBaud = fingerprintWorkingBaud;
   unsigned long savedLastLCDMessageAt = lastLCDMessageAt;
   String savedLcdLine1 = lastLcdLine1;
   String savedLcdLine2 = lastLcdLine2;
@@ -1868,16 +1973,21 @@ void runSoftwareValidation() {
 
   User* employeeA = findUserByFingerprintID(1);
   User* employeeB = findUserByFingerprintID(2);
-  User* itAdmin = findUserByFingerprintID(3);
-  User* manager = findUserByFingerprintID(4);
-  User* employeeC = findUserByFingerprintID(5);
-  User* employeeD = findUserByFingerprintID(6);
+  User* employeeC = findUserByFingerprintID(3);
+  User* employeeD = findUserByFingerprintID(4);
+  User* itAdmin = findUserByFingerprintID(5);
+  User* manager = findUserByFingerprintID(6);
 
-  validate("All six configured fingerprint IDs resolve",
+  validate("Fingerprint IDs 1-6 map to the exact configured users",
            employeeA != nullptr && employeeB != nullptr && itAdmin != nullptr &&
-               manager != nullptr && employeeC != nullptr && employeeD != nullptr,
-           "IDs 1-6 mapped to local users",
-           "One or more IDs missing");
+               manager != nullptr && employeeC != nullptr && employeeD != nullptr &&
+               employeeA->name == "Employee A" &&
+               employeeB->name == "Employee B" &&
+               employeeC->name == "Employee C" &&
+               employeeD->name == "Employee D" &&
+               itAdmin->name == "IT Admin" && manager->name == "Manager",
+           "1=A, 2=B, 3=C, 4=D, 5=IT Admin, 6=Manager",
+           "fingerprint-to-user mapping mismatch");
   validate("Employee A -> Company A permission",
            checkPermission(employeeA, COMPANY_A),
            "allowed",
@@ -1959,13 +2069,13 @@ void runSoftwareValidation() {
            "Main + Server only",
            "permission profile mismatch");
 
-  const Area allAreas[] = {MAIN_ENTRANCE,
-                           COMPANY_A,
+  const Area allAreas[] = {COMPANY_A,
                            COMPANY_B,
+                           COMPANY_C,
+                           COMPANY_D,
                            SERVER_ROOM,
                            MANAGEMENT_ADMIN,
-                           COMPANY_C,
-                           COMPANY_D};
+                           MAIN_ENTRANCE};
   constexpr size_t allAreaCount = sizeof(allAreas) / sizeof(allAreas[0]);
   bool allUsersStartOutside = true;
   for (size_t userIndex = 0; userIndex < USER_COUNT; ++userIndex) {
@@ -2025,6 +2135,112 @@ void runSoftwareValidation() {
            getAreaName(invalidArea) == "None",
            "None",
            getAreaName(invalidArea));
+  validate("Area commands 1-7 use the exact new mapping",
+           static_cast<int>(COMPANY_A) == 1 &&
+               static_cast<int>(COMPANY_B) == 2 &&
+               static_cast<int>(COMPANY_C) == 3 &&
+               static_cast<int>(COMPANY_D) == 4 &&
+               static_cast<int>(SERVER_ROOM) == 5 &&
+               static_cast<int>(MANAGEMENT_ADMIN) == 6 &&
+               static_cast<int>(MAIN_ENTRANCE) == 7 &&
+               getAreaName(static_cast<Area>(1)) == "Company A" &&
+               getAreaName(static_cast<Area>(2)) == "Company B" &&
+               getAreaName(static_cast<Area>(3)) == "Company C" &&
+               getAreaName(static_cast<Area>(4)) == "Company D" &&
+               getAreaName(static_cast<Area>(5)) == "Server Room" &&
+               getAreaName(static_cast<Area>(6)) == "Management / Admin" &&
+               getAreaName(static_cast<Area>(7)) == "Main Entrance",
+           "1=A, 2=B, 3=C, 4=D, 5=Server, 6=Management, 7=Main",
+           "area command mapping mismatch");
+  validate("insideMask bits 0-6 match the new area order",
+           getAreaBit(COMPANY_A) == (1 << 0) &&
+               getAreaBit(COMPANY_B) == (1 << 1) &&
+               getAreaBit(COMPANY_C) == (1 << 2) &&
+               getAreaBit(COMPANY_D) == (1 << 3) &&
+               getAreaBit(SERVER_ROOM) == (1 << 4) &&
+               getAreaBit(MANAGEMENT_ADMIN) == (1 << 5) &&
+               getAreaBit(MAIN_ENTRANCE) == (1 << 6),
+           "bits 0-6 follow commands 1-7",
+           "insideMask bit mapping mismatch");
+
+  validate("Entry without a selected area is rejected before fingerprint scan",
+           evaluateAccessPrecheck(MODE_ENTRY,
+                                  false,
+                                  AREA_NONE,
+                                  false,
+                                  true,
+                                  true,
+                                  true) == ACCESS_PRECHECK_NO_AREA,
+           "NO_AREA",
+           "wrong precheck result");
+  failedAttempts = 1;
+  AccessPrecheckResult noPersonEntry = evaluateAccessPrecheck(
+      MODE_ENTRY, false, COMPANY_A, false, true, false, true);
+  validate("Entry without a nearby person is rejected without a failure count",
+           noPersonEntry == ACCESS_PRECHECK_PERSON_NOT_NEAR &&
+               failedAttempts == 1,
+           "PERSON_NOT_NEAR and counter unchanged",
+           "precheck or counter mismatch");
+  AccessPrecheckResult timeoutEntry = evaluateAccessPrecheck(
+      MODE_ENTRY, false, COMPANY_A, false, false, false, true);
+  validate("Entry ultrasonic timeout is rejected before fingerprint scan",
+           timeoutEntry == ACCESS_PRECHECK_ULTRASONIC_INVALID,
+           "ULTRASONIC_INVALID",
+           "wrong precheck result");
+  validate("Authorized Entry precheck passes only with valid near presence",
+           evaluateAccessPrecheck(MODE_ENTRY,
+                                  false,
+                                  COMPANY_A,
+                                  false,
+                                  true,
+                                  true,
+                                  true) == ACCESS_PRECHECK_OK,
+           "OK",
+           "blocked");
+  validate("Unavailable fingerprint sensor blocks scan after Entry checks",
+           evaluateAccessPrecheck(MODE_ENTRY,
+                                  false,
+                                  COMPANY_A,
+                                  false,
+                                  true,
+                                  true,
+                                  false) ==
+               ACCESS_PRECHECK_FINGERPRINT_UNAVAILABLE,
+           "FINGERPRINT_UNAVAILABLE",
+           "wrong precheck result");
+  validate("X without a selected area is rejected",
+           !canEnableExitModeForState(false, AREA_NONE, false),
+           "rejected",
+           "enabled");
+  validate("X during Lockdown is rejected",
+           !canEnableExitModeForState(true, COMPANY_A, false),
+           "rejected",
+           "enabled");
+  validate("X while the door is open is rejected",
+           !canEnableExitModeForState(false, COMPANY_A, true),
+           "rejected",
+           "enabled");
+  validate("Exit precheck does not require an ultrasonic measurement",
+           evaluateAccessPrecheck(MODE_EXIT,
+                                  false,
+                                  COMPANY_A,
+                                  false,
+                                  false,
+                                  false,
+                                  true) == ACCESS_PRECHECK_OK,
+           "OK without ultrasonic",
+           "blocked");
+  currentMode = MODE_EXIT;
+  returnToEntryMode();
+  validate("Completed Exit attempts return to Entry Mode",
+           currentMode == MODE_ENTRY,
+           "ENTRY",
+           getAccessModeName(currentMode));
+  doorOpen = false;
+  validate("Unauthorized Entry is rejected before the door opens",
+           !canUserEnterArea(employeeA, COMPANY_B) && !doorOpen,
+           "denied and door closed",
+           "entry allowed or door opened");
 
   if (employeeA != nullptr) {
     employeeA->insideMask = 0;
@@ -2050,10 +2266,22 @@ void runSoftwareValidation() {
            !isUserInsideArea(employeeA, COMPANY_B),
            "Company B OUTSIDE",
            "Company B INSIDE");
-  validate("Anti-passback rejects duplicate Company A entry",
-           !canUserEnterArea(employeeA, COMPANY_A),
-           "entry denied",
-           "entry allowed");
+  if (employeeC != nullptr) {
+    employeeC->insideMask = 0;
+  }
+  markUserInsideArea(employeeC, COMPANY_C);
+  validate("New Company C bit drives only Company C occupancy",
+           countUsersInsideArea(COMPANY_C) == 1 &&
+               countUsersInsideArea(COMPANY_D) == 0 &&
+               !isUserInsideArea(employeeC, COMPANY_D),
+           "Company C=1, Company D=0",
+           "occupancy or area bit leaked");
+  markUserOutsideArea(employeeC, COMPANY_C);
+  doorOpen = false;
+  validate("Duplicate Entry is rejected without opening the door",
+           !canUserEnterArea(employeeA, COMPANY_A) && !doorOpen,
+           "entry denied and door closed",
+           "entry allowed or door opened");
   validate("Employee A may exit Company A while inside",
            canUserExitArea(employeeA, COMPANY_A),
            "exit allowed",
@@ -2067,6 +2295,15 @@ void runSoftwareValidation() {
            !canUserExitArea(employeeA, COMPANY_A),
            "exit denied",
            "exit allowed");
+  failedAttempts = 2;
+  if (!canUserExitArea(employeeA, COMPANY_A) &&
+      COUNT_EXIT_OUTSIDE_AS_FAILED_ATTEMPT) {
+    updateFailedAttemptCounter();
+  }
+  validate("Already-outside Exit leaves the failure counter unchanged",
+           failedAttempts == 2,
+           "2",
+           String(failedAttempts));
   validate("Entry is allowed again after exit",
            canUserEnterArea(employeeA, COMPANY_A),
            "entry allowed",
@@ -2218,6 +2455,63 @@ void runSoftwareValidation() {
            "blocked",
            "allowed");
 
+  validate("Fingerprint deletion is blocked without Admin Mode",
+           evaluateFingerprintDeleteGate(false, true, false) ==
+               FINGERPRINT_DELETE_BLOCKED_ADMIN,
+           "blocked",
+           "allowed");
+  validate("Fingerprint deletion is blocked during Lockdown",
+           evaluateFingerprintDeleteGate(true, true, true) ==
+               FINGERPRINT_DELETE_BLOCKED_LOCKDOWN,
+           "blocked",
+           "allowed");
+  validate("Fingerprint deletion is blocked when sensor is not ready",
+           evaluateFingerprintDeleteGate(false, false, true) ==
+               FINGERPRINT_DELETE_BLOCKED_SENSOR,
+           "blocked",
+           "allowed");
+  validate("C alone only arms confirmation and cannot approve deletion",
+           evaluateFingerprintDeleteGate(false, true, true) ==
+                   FINGERPRINT_DELETE_ALLOWED &&
+               evaluateFingerprintDeleteConfirmation("C", false, true, true) ==
+                   FINGERPRINT_DELETE_CANCELLED_TEXT,
+           "confirmation pending; no delete approval",
+           "unexpected delete approval");
+  validate("Only exact uppercase DELETE confirms fingerprint deletion",
+           evaluateFingerprintDeleteConfirmation("DELETE", false, true, true) ==
+                   FINGERPRINT_DELETE_CONFIRMED &&
+               evaluateFingerprintDeleteConfirmation("delete", false, true, true) ==
+                   FINGERPRINT_DELETE_CANCELLED_TEXT &&
+               evaluateFingerprintDeleteConfirmation("DELETE ", false, true, true) ==
+                   FINGERPRINT_DELETE_CANCELLED_TEXT,
+           "only exact DELETE approved",
+           "non-exact text approved");
+  validate("Other delete confirmation text cancels",
+           evaluateFingerprintDeleteConfirmation("NO", false, true, true) ==
+               FINGERPRINT_DELETE_CANCELLED_TEXT,
+           "cancelled",
+           "approved");
+  validate("Expired Admin Mode cancels pending fingerprint deletion",
+           evaluateFingerprintDeleteConfirmation("DELETE", false, true, false) ==
+               FINGERPRINT_DELETE_CANCELLED_ADMIN,
+           "cancelled",
+           "approved");
+  validate("Configured fingerprint deletion IDs are exactly 1-6",
+           configuredFingerprintDeleteIDsAreExactly1To6(),
+           "1,2,3,4,5,6",
+           "delete ID list mismatch");
+  AccessControlStateSnapshot deleteDecisionState = captureAccessControlState();
+  bool employeeAPermissionBeforeDeleteDecision =
+      employeeA != nullptr && employeeA->canAccessCompanyA;
+  evaluateFingerprintDeleteGate(false, true, true);
+  evaluateFingerprintDeleteConfirmation("DELETE", false, true, true);
+  validate("Fingerprint delete decisions preserve access-control state",
+           isAccessControlStateUnchanged(deleteDecisionState) &&
+               employeeA != nullptr && employeeA->canAccessCompanyA ==
+                                            employeeAPermissionBeforeDeleteDecision,
+           "permissions, attendance, door, area and mode unchanged",
+           "access-control state changed");
+
   validate("LCD dimensions are 16x2",
            LCD_COLUMNS == 16 && LCD_ROWS == 2,
            "16 columns, 2 rows",
@@ -2251,19 +2545,32 @@ void runSoftwareValidation() {
            ">= 5000 ms",
            String(DOOR_MIN_OPEN_TIME_MS) + " ms");
   validate("Door stays open before minimum-open time",
-           !shouldCloseDoorForState(true, DOOR_MIN_OPEN_TIME_MS - 1, false),
+           !shouldCloseDoorForState(
+               true, DOOR_MIN_OPEN_TIME_MS - 1, true, false),
            "stay open",
            "close");
-  validate("Door closes after minimum time when area is clear",
-           shouldCloseDoorForState(true, DOOR_MIN_OPEN_TIME_MS, false),
+  float clearDistanceCm = PRESENCE_DISTANCE_CM + 0.1f;
+  validate("Door closes only after a valid clear-distance measurement",
+           shouldCloseDoorForState(
+               true,
+               DOOR_MIN_OPEN_TIME_MS,
+               isUltrasonicMeasurementValid(clearDistanceCm),
+               isDistanceNear(clearDistanceCm)),
            "close",
            "stay open");
   validate("Door stays open while a person remains near",
-           !shouldCloseDoorForState(true, DOOR_MIN_OPEN_TIME_MS, true),
+           !shouldCloseDoorForState(
+               true, DOOR_MIN_OPEN_TIME_MS, true, true),
+           "stay open",
+           "close");
+  validate("Door stays open when ultrasonic measurement times out",
+           !shouldCloseDoorForState(
+               true, DOOR_MIN_OPEN_TIME_MS, false, false),
            "stay open",
            "close");
   validate("Closed door never requests another close",
-           !shouldCloseDoorForState(false, DOOR_MIN_OPEN_TIME_MS, false),
+           !shouldCloseDoorForState(
+               false, DOOR_MIN_OPEN_TIME_MS, true, false),
            "no close request",
            "close requested");
 
@@ -2283,6 +2590,11 @@ void runSoftwareValidation() {
            !isDistanceNear(-1.0),
            "not near",
            "near");
+  validate("Timeout and zero are invalid ultrasonic measurements",
+           !isUltrasonicMeasurementValid(-1.0) &&
+               !isUltrasonicMeasurementValid(0.0),
+           "both invalid",
+           "one treated as valid");
   validate("Entry Mode requires ultrasonic presence",
            isPresenceRequiredForMode(MODE_ENTRY),
            "required",
@@ -2339,6 +2651,14 @@ void runSoftwareValidation() {
            isLCDCacheUnchanged(diagnosticState),
            "LCD cache restored",
            "LCD cache mismatch");
+  fingerprintReady = false;
+  fingerprintWorkingBaud = 0;
+  restoreWorkingFingerprintState(true, FINGERPRINT_PRIMARY_BAUD);
+  validate("Fingerprint diagnostic restores a previously working sensor state",
+           fingerprintReady &&
+               fingerprintWorkingBaud == FINGERPRINT_PRIMARY_BAUD,
+           "ready at 57600",
+           "working state lost");
   validate("Ultrasonic pulse timeout is finite",
            ULTRASONIC_ECHO_TIMEOUT_US == 30000,
            "30000 us",
@@ -2364,8 +2684,17 @@ void runSoftwareValidation() {
            SERVO_USE_SIMPLE_ATTACH == 1,
            "enabled",
            "disabled");
+  validate("Verified hardware GPIO map is unchanged",
+           FINGER_RX_PIN == 16 && FINGER_TX_PIN == 17 &&
+               SERVO_PIN == 13 && ULTRASONIC_TRIG_PIN == 21 &&
+               ULTRASONIC_ECHO_PIN == 22 && LCD_SDA_PIN == 14 &&
+               LCD_SCL_PIN == 27 && RFID_SS_PIN == 5 &&
+               RFID_SCK_PIN == 18 && RFID_MOSI_PIN == 23 &&
+               RFID_MISO_PIN == 19 && RFID_RST_PIN == 33,
+           "Finger 16/17, Servo 13, Ultra 21/22, LCD 14/27, RFID 5/18/23/19/33",
+           "pin map mismatch");
 
-  const char serialCommands[] = {'E', 'R', 'P', 'X', 'M', 'S', 'T',
+  const char serialCommands[] = {'E', 'C', 'R', 'P', 'X', 'M', 'S', 'T',
                                  'G', 'D', 'U', 'F', 'V', 'W'};
   constexpr size_t serialCommandCount =
       sizeof(serialCommands) / sizeof(serialCommands[0]);
@@ -2381,15 +2710,16 @@ void runSoftwareValidation() {
            serialCommandsUnique,
            "no conflicts",
            "duplicate command");
-  bool areaCommandMappingValid = true;
-  for (int areaNumber = 1; areaNumber <= 7; ++areaNumber) {
-    Area area = static_cast<Area>(areaNumber);
-    areaCommandMappingValid &= getAreaName(area) != "None";
-  }
-  validate("Serial area commands 1-7 map to valid areas",
-           areaCommandMappingValid,
-           "all valid",
-           "one or more invalid");
+  validate("Serial area commands 1-7 map to valid distinct bits",
+           getAreaBit(static_cast<Area>(1)) == 0x01 &&
+               getAreaBit(static_cast<Area>(2)) == 0x02 &&
+               getAreaBit(static_cast<Area>(3)) == 0x04 &&
+               getAreaBit(static_cast<Area>(4)) == 0x08 &&
+               getAreaBit(static_cast<Area>(5)) == 0x10 &&
+               getAreaBit(static_cast<Area>(6)) == 0x20 &&
+               getAreaBit(static_cast<Area>(7)) == 0x40,
+           "0x01,0x02,0x04,0x08,0x10,0x20,0x40",
+           "invalid or duplicate area bit");
   validate("Component GPIO assignments have no conflicts",
            validatePinAssignments(),
            "no conflicts",
@@ -2405,12 +2735,15 @@ void runSoftwareValidation() {
   selectedArea = savedSelectedArea;
   currentMode = savedCurrentMode;
   waitingForEnrollmentID = savedWaitingForEnrollmentID;
+  waitingForDeleteConfirmation = savedWaitingForDeleteConfirmation;
   doorOpen = savedDoorOpen;
   doorOpenedAt = savedDoorOpenedAt;
   lastDistanceCm = savedLastDistanceCm;
   lastUltrasonicCheckAt = savedLastUltrasonicCheckAt;
   ultrasonicHasMeasurement = savedUltrasonicHasMeasurement;
   presencePromptVisible = savedPresencePromptVisible;
+  fingerprintReady = savedFingerprintReady;
+  fingerprintWorkingBaud = savedFingerprintWorkingBaud;
   lastLCDMessageAt = savedLastLCDMessageAt;
   lastLcdLine1 = savedLcdLine1;
   lastLcdLine2 = savedLcdLine2;
@@ -2531,7 +2864,7 @@ void setupRFID() {
     Serial.println(version, HEX);
   } else {
     Serial.println("[RFID] Reader not initialized.");
-    Serial.println("Check 3.3V power, SPI wiring, and GPIO 27 reset wiring.");
+    Serial.println("Check 3.3V power, SPI wiring, and GPIO 33 reset wiring.");
   }
 }
 
@@ -2781,6 +3114,218 @@ void testSimpleFingerprintScan() {
   lcdShowMessage("FINGER ERROR", "SEARCH FAILED");
 }
 
+FingerprintDeleteGateResult evaluateFingerprintDeleteGate(
+    bool locked,
+    bool sensorReady,
+    bool adminActive) {
+  if (locked) {
+    return FINGERPRINT_DELETE_BLOCKED_LOCKDOWN;
+  }
+  if (!sensorReady) {
+    return FINGERPRINT_DELETE_BLOCKED_SENSOR;
+  }
+  if (!adminActive) {
+    return FINGERPRINT_DELETE_BLOCKED_ADMIN;
+  }
+  return FINGERPRINT_DELETE_ALLOWED;
+}
+
+FingerprintDeleteConfirmationResult evaluateFingerprintDeleteConfirmation(
+    const String& input,
+    bool locked,
+    bool sensorReady,
+    bool adminActive) {
+  if (locked) {
+    return FINGERPRINT_DELETE_CANCELLED_LOCKDOWN;
+  }
+  if (!sensorReady) {
+    return FINGERPRINT_DELETE_CANCELLED_SENSOR;
+  }
+  if (!adminActive) {
+    return FINGERPRINT_DELETE_CANCELLED_ADMIN;
+  }
+  return input == "DELETE" ? FINGERPRINT_DELETE_CONFIRMED
+                           : FINGERPRINT_DELETE_CANCELLED_TEXT;
+}
+
+bool configuredFingerprintDeleteIDsAreExactly1To6() {
+  if (FINGERPRINT_DELETE_ID_COUNT != 6) {
+    return false;
+  }
+  for (size_t i = 0; i < FINGERPRINT_DELETE_ID_COUNT; ++i) {
+    if (FINGERPRINT_DELETE_IDS[i] != i + 1) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool isFingerprintSlotEmptyResult(uint8_t result) {
+  return result == FINGERPRINT_NOTFOUND ||
+         result == FINGERPRINT_DBRANGEFAIL;
+}
+
+String getFingerprintDeleteError(uint8_t result) {
+  switch (result) {
+    case FINGERPRINT_DELETEFAIL:
+      return "sensor could not delete the template";
+    case FINGERPRINT_DBRANGEFAIL:
+      return "template slot is empty or invalid";
+    case FINGERPRINT_NOTFOUND:
+      return "template not found";
+    default:
+      return getFingerprintError(result);
+  }
+}
+
+void cancelFingerprintDeleteConfirmation(String reason) {
+  waitingForDeleteConfirmation = false;
+  Serial.println("[FINGERPRINT DELETE CANCELLED]");
+  if (reason.length() > 0) {
+    Serial.print("Reason: ");
+    Serial.println(reason);
+  }
+  Serial.println();
+  lcdShowMessage("DELETE CANCELLED", "NO IDS DELETED");
+}
+
+void requestConfiguredFingerprintDeletion() {
+  FingerprintDeleteGateResult gate = evaluateFingerprintDeleteGate(
+      systemLocked,
+      fingerprintReady,
+      isAdminModeActive());
+
+  if (gate == FINGERPRINT_DELETE_BLOCKED_LOCKDOWN) {
+    Serial.println("[SYSTEM LOCKED]");
+    Serial.println("Fingerprint deletion is blocked.");
+    Serial.println("Scan Admin RFID card to unlock.");
+    showLockdownStatus();
+    return;
+  }
+  if (gate == FINGERPRINT_DELETE_BLOCKED_SENSOR) {
+    Serial.println("[FINGERPRINT ERROR]");
+    Serial.println("Cannot delete fingerprints. Sensor not detected.");
+    Serial.println("Run command F for diagnostics.");
+    lcdShowMessage("FINGER ERROR", "DELETE BLOCKED");
+    return;
+  }
+  if (gate == FINGERPRINT_DELETE_BLOCKED_ADMIN) {
+    Serial.println("[ADMIN REQUIRED]");
+    Serial.println("Fingerprint deletion is allowed only in Admin Mode.");
+    Serial.println("Scan the Admin RFID card first.");
+    lcdShowMessage("ADMIN REQUIRED", "SCAN ADMIN RFID");
+    return;
+  }
+
+  waitingForDeleteConfirmation = true;
+  Serial.println();
+  Serial.println("[FINGERPRINT DELETE]");
+  Serial.println("This will delete fingerprint IDs 1-6.");
+  Serial.println("Type DELETE to confirm.");
+  Serial.println();
+  lcdShowMessage("DELETE IDS 1-6", "TYPE DELETE");
+}
+
+void handleFingerprintDeleteConfirmation(const String& input) {
+  bool adminActive = isAdminModeActive();
+  if (!waitingForDeleteConfirmation) {
+    // The timeout handler already cancelled and reported this request.
+    return;
+  }
+
+  FingerprintDeleteConfirmationResult confirmation =
+      evaluateFingerprintDeleteConfirmation(
+          input,
+          systemLocked,
+          fingerprintReady,
+          adminActive);
+
+  // Every confirmation attempt leaves the waiting state before any sensor I/O.
+  waitingForDeleteConfirmation = false;
+
+  switch (confirmation) {
+    case FINGERPRINT_DELETE_CONFIRMED:
+      deleteConfiguredFingerprints();
+      return;
+    case FINGERPRINT_DELETE_CANCELLED_LOCKDOWN:
+      cancelFingerprintDeleteConfirmation("System entered Lockdown.");
+      return;
+    case FINGERPRINT_DELETE_CANCELLED_SENSOR:
+      cancelFingerprintDeleteConfirmation("Fingerprint sensor is not ready.");
+      return;
+    case FINGERPRINT_DELETE_CANCELLED_ADMIN:
+      cancelFingerprintDeleteConfirmation("Admin Mode is not active or expired.");
+      return;
+    case FINGERPRINT_DELETE_CANCELLED_TEXT:
+    default:
+      cancelFingerprintDeleteConfirmation("Confirmation text did not exactly match DELETE.");
+      return;
+  }
+}
+
+void deleteConfiguredFingerprints() {
+  int deletedCount = 0;
+  int emptyCount = 0;
+  int failedCount = 0;
+
+  Serial.println("[FINGERPRINT DELETE START]");
+  for (size_t i = 0; i < FINGERPRINT_DELETE_ID_COUNT; ++i) {
+    uint16_t id = FINGERPRINT_DELETE_IDS[i];
+
+    // loadModel() is read-only and helps distinguish an already-empty slot
+    // from a genuine delete/flash failure on sensors that return DELETEFAIL
+    // for both cases. deleteModel() is still issued once for every ID 1-6.
+    uint8_t loadResult = finger.loadModel(id);
+    bool slotWasEmpty = isFingerprintSlotEmptyResult(loadResult);
+    uint8_t deleteResult = finger.deleteModel(id);
+
+    Serial.print("ID ");
+    Serial.print(id);
+    if (deleteResult == FINGERPRINT_OK) {
+      ++deletedCount;
+      Serial.println(": DELETED");
+      continue;
+    }
+
+    bool notFound = isFingerprintSlotEmptyResult(deleteResult) ||
+                    (slotWasEmpty &&
+                     deleteResult == FINGERPRINT_DELETEFAIL);
+    if (notFound) {
+      ++emptyCount;
+      Serial.println(": ALREADY EMPTY / NOT FOUND");
+      continue;
+    }
+
+    ++failedCount;
+    Serial.print(": FAILED - ");
+    Serial.print(getFingerprintDeleteError(deleteResult));
+    Serial.print(" (code 0x");
+    if (deleteResult < 0x10) {
+      Serial.print('0');
+    }
+    Serial.print(deleteResult, HEX);
+    Serial.println(')');
+  }
+
+  Serial.println();
+  Serial.print("Deleted successfully: ");
+  Serial.println(deletedCount);
+  Serial.print("Already empty / not found: ");
+  Serial.println(emptyCount);
+  Serial.print("Failed: ");
+  Serial.println(failedCount);
+
+  if (failedCount == 0) {
+    Serial.println("[FINGERPRINT DELETE COMPLETE]");
+    lcdShowMessage("DELETE COMPLETE", "ENROLL IDS 1-6");
+  } else {
+    Serial.println("[FINGERPRINT DELETE FINISHED WITH ERRORS]");
+    Serial.println("One or more IDs were not deleted. Review the error codes above.");
+    lcdShowMessage("DELETE ERRORS", "CHECK SERIAL");
+  }
+  Serial.println();
+}
+
 bool enrollFingerprint(int id) {
   if (isSystemLocked()) {
     Serial.println("[SYSTEM LOCKED]");
@@ -2967,7 +3512,50 @@ void handleSerialCommand() {
   }
 }
 
+bool canEnableExitModeForState(bool locked,
+                               Area area,
+                               bool isDoorOpen) {
+  return !locked && area != AREA_NONE && !isDoorOpen;
+}
+
+AccessPrecheckResult evaluateAccessPrecheck(
+    AccessMode mode,
+    bool locked,
+    Area area,
+    bool isDoorOpen,
+    bool ultrasonicMeasurementValid,
+    bool personNear,
+    bool fingerprintAvailable) {
+  if (locked) {
+    return ACCESS_PRECHECK_LOCKED;
+  }
+  if (area == AREA_NONE) {
+    return ACCESS_PRECHECK_NO_AREA;
+  }
+  if (isDoorOpen) {
+    return ACCESS_PRECHECK_DOOR_OPEN;
+  }
+  if (isPresenceRequiredForMode(mode)) {
+    if (!ultrasonicMeasurementValid) {
+      return ACCESS_PRECHECK_ULTRASONIC_INVALID;
+    }
+    if (!personNear) {
+      return ACCESS_PRECHECK_PERSON_NOT_NEAR;
+    }
+  }
+  if (!fingerprintAvailable) {
+    return ACCESS_PRECHECK_FINGERPRINT_UNAVAILABLE;
+  }
+  return ACCESS_PRECHECK_OK;
+}
+
 void processSerialInput(String input) {
+  if (waitingForDeleteConfirmation) {
+    // Do not trim or normalize: confirmation must be exactly uppercase DELETE.
+    handleFingerprintDeleteConfirmation(input);
+    return;
+  }
+
   input.trim();
 
   if (input.length() == 0) {
@@ -3034,6 +3622,10 @@ void processSerialInput(String input) {
   }
 
   switch (command) {
+    case 'C':
+      requestConfiguredFingerprintDeletion();
+      break;
+
     case 'E':
       if (isSystemLocked()) {
         Serial.println("[SYSTEM LOCKED]");
@@ -3100,24 +3692,20 @@ void processSerialInput(String input) {
       break;
 
     case 'X':
-      if (isSystemLocked()) {
-        Serial.println("[SYSTEM LOCKED]");
-        Serial.println("Exit Mode is blocked. Scan Admin RFID card to unlock.");
-        showLockdownStatus();
-        triggerErrorAlert();
-        return;
-      }
-      if (selectedArea == AREA_NONE) {
-        Serial.println("[EXIT MODE ERROR]");
-        Serial.println("Please select an area first using 1-7.");
-        lcdShowError("Select Area", "Before Exit");
-        triggerErrorAlert();
-        return;
-      }
-      if (doorOpen) {
-        Serial.println("[EXIT MODE ERROR]");
-        Serial.println("Door is already open.");
-        lcdShowError("Door Is Open", "Wait To Close");
+      if (!canEnableExitModeForState(systemLocked, selectedArea, doorOpen)) {
+        if (isSystemLocked()) {
+          Serial.println("[SYSTEM LOCKED]");
+          Serial.println("Exit Mode is blocked. Scan Admin RFID card to unlock.");
+          showLockdownStatus();
+        } else if (selectedArea == AREA_NONE) {
+          Serial.println("[EXIT MODE ERROR]");
+          Serial.println("Please select an area first using 1-7.");
+          lcdShowError("Select Area", "Before Exit");
+        } else {
+          Serial.println("[EXIT MODE ERROR]");
+          Serial.println("Door is already open.");
+          lcdShowError("Door Is Open", "Wait To Close");
+        }
         triggerErrorAlert();
         return;
       }
@@ -3162,20 +3750,20 @@ void handleAreaSelection(char command) {
 
 String getAreaName(Area area) {
   switch (area) {
-    case MAIN_ENTRANCE:
-      return "Main Entrance";
     case COMPANY_A:
       return "Company A";
     case COMPANY_B:
       return "Company B";
-    case SERVER_ROOM:
-      return "Server Room";
-    case MANAGEMENT_ADMIN:
-      return "Management / Admin";
     case COMPANY_C:
       return "Company C";
     case COMPANY_D:
       return "Company D";
+    case SERVER_ROOM:
+      return "Server Room";
+    case MANAGEMENT_ADMIN:
+      return "Management / Admin";
+    case MAIN_ENTRANCE:
+      return "Main Entrance";
     default:
       return "None";
   }
@@ -3218,8 +3806,8 @@ bool checkPermission(User* user, Area area) {
 
 int getAreaBit(Area area) {
   int areaNumber = static_cast<int>(area);
-  if (areaNumber < static_cast<int>(MAIN_ENTRANCE) ||
-      areaNumber > static_cast<int>(COMPANY_D)) {
+  if (areaNumber < static_cast<int>(COMPANY_A) ||
+      areaNumber > static_cast<int>(MAIN_ENTRANCE)) {
     return 0;
   }
 
@@ -3319,13 +3907,13 @@ void printUserInsideStatus(User* user) {
     return;
   }
 
-  const Area trackedAreas[] = {MAIN_ENTRANCE,
-                               COMPANY_A,
+  const Area trackedAreas[] = {COMPANY_A,
                                COMPANY_B,
                                COMPANY_C,
                                COMPANY_D,
                                SERVER_ROOM,
-                               MANAGEMENT_ADMIN};
+                               MANAGEMENT_ADMIN,
+                               MAIN_ENTRANCE};
   constexpr size_t trackedAreaCount =
       sizeof(trackedAreas) / sizeof(trackedAreas[0]);
 
@@ -3353,13 +3941,13 @@ int countUsersInsideArea(Area area) {
 }
 
 void printAllInsideStatus() {
-  const Area trackedAreas[] = {MAIN_ENTRANCE,
-                               COMPANY_A,
+  const Area trackedAreas[] = {COMPANY_A,
                                COMPANY_B,
                                COMPANY_C,
                                COMPANY_D,
                                SERVER_ROOM,
-                               MANAGEMENT_ADMIN};
+                               MANAGEMENT_ADMIN,
+                               MAIN_ENTRANCE};
   constexpr size_t trackedAreaCount =
       sizeof(trackedAreas) / sizeof(trackedAreas[0]);
 
@@ -3558,53 +4146,79 @@ String getFingerprintError(uint8_t result) {
 }
 
 void testFingerprintAccess() {
-  if (isSystemLocked()) {
-    Serial.println("[SYSTEM LOCKED]");
-    Serial.println("Fingerprint access is blocked.");
-    Serial.println("Scan Admin RFID card to unlock.");
-    incrementFailedAttempts("Fingerprint access attempted during lockdown");
-    showLockdownStatus();
-    triggerAccessDeniedAlert();
-    return;
+  bool ultrasonicMeasurementValid = true;
+  bool personNear = false;
+  if (!systemLocked && selectedArea != AREA_NONE && !doorOpen &&
+      isPresenceRequiredForMode(currentMode)) {
+    // R requires a fresh valid measurement in Entry Mode. Exit Mode skips
+    // this read entirely and never uses presence as a scan precondition.
+    updateUltrasonicMeasurement(true);
+    ultrasonicMeasurementValid =
+        isUltrasonicMeasurementValid(lastDistanceCm);
+    personNear = isDistanceNear(lastDistanceCm);
   }
 
-  if (selectedArea == AREA_NONE) {
-    Serial.println("[ERROR]");
-    Serial.println("Please select an area first using 1-7");
-    lcdShowError("Select Area", "First");
-    triggerErrorAlert();
-    return;
-  }
+  AccessPrecheckResult precheck = evaluateAccessPrecheck(
+      currentMode,
+      systemLocked,
+      selectedArea,
+      doorOpen,
+      ultrasonicMeasurementValid,
+      personNear,
+      fingerprintReady);
 
-  if (doorOpen) {
-    Serial.println("[ACCESS BLOCKED]");
-    Serial.println("Door is already open. Wait for it to close.");
-    lcdShowError("Door Is Open", "Wait To Close");
-    triggerErrorAlert();
-    returnToEntryMode();
-    return;
-  }
+  if (precheck != ACCESS_PRECHECK_OK) {
+    switch (precheck) {
+      case ACCESS_PRECHECK_LOCKED:
+        Serial.println("[SYSTEM LOCKED]");
+        Serial.println("Fingerprint access is blocked.");
+        Serial.println("Scan Admin RFID card to unlock.");
+        incrementFailedAttempts("Fingerprint access attempted during lockdown");
+        showLockdownStatus();
+        triggerAccessDeniedAlert();
+        break;
 
-  if (isPresenceRequiredForMode(currentMode) && !isPersonNear()) {
-    Serial.println("[ENTRY BLOCKED]");
-    Serial.println("No person detected near door.");
-    if (lastDistanceCm <= 0.0) {
-      Serial.println("Ultrasonic measurement unavailable or timed out.");
-    } else {
-      Serial.print("Current Distance: ");
-      Serial.print(lastDistanceCm, 1);
-      Serial.println(" cm");
+      case ACCESS_PRECHECK_NO_AREA:
+        Serial.println("[ERROR]");
+        Serial.println("Please select an area first using 1-7");
+        lcdShowError("Select Area", "First");
+        triggerErrorAlert();
+        break;
+
+      case ACCESS_PRECHECK_DOOR_OPEN:
+        Serial.println("[ACCESS BLOCKED]");
+        Serial.println("Door is already open. Wait for it to close.");
+        lcdShowError("Door Is Open", "Wait To Close");
+        triggerErrorAlert();
+        break;
+
+      case ACCESS_PRECHECK_ULTRASONIC_INVALID:
+        Serial.println("[ENTRY BLOCKED]");
+        Serial.println("Ultrasonic measurement unavailable or timed out.");
+        Serial.println("No fingerprint scan was started; door remains closed.");
+        lcdShowMessage("ULTRA TIMEOUT", "ENTRY BLOCKED");
+        break;
+
+      case ACCESS_PRECHECK_PERSON_NOT_NEAR:
+        Serial.println("[ENTRY BLOCKED]");
+        Serial.println("No person detected within 20 cm of the door.");
+        Serial.print("Current Distance: ");
+        Serial.print(lastDistanceCm, 1);
+        Serial.println(" cm");
+        lcdShowMessage("COME CLOSER", "NO PERSON NEAR");
+        break;
+
+      case ACCESS_PRECHECK_FINGERPRINT_UNAVAILABLE:
+        Serial.println("[FINGERPRINT ERROR]");
+        Serial.println("Cannot scan. Sensor not detected.");
+        Serial.println("Run command F for baud-rate, wiring, and power diagnostics.");
+        lcdShowMessage("FINGER ERROR", "CANNOT SCAN");
+        triggerErrorAlert();
+        break;
+
+      case ACCESS_PRECHECK_OK:
+        break;
     }
-    lcdShowMessage("COME CLOSER", "NO PERSON NEAR");
-    return;
-  }
-
-  if (!fingerprintReady) {
-    Serial.println("[FINGERPRINT ERROR]");
-    Serial.println("Cannot scan. Sensor not detected.");
-    Serial.println("Run command F for baud-rate, wiring, and power diagnostics.");
-    lcdShowMessage("FINGER ERROR", "CANNOT SCAN");
-    triggerErrorAlert();
     returnToEntryMode();
     return;
   }

@@ -23,7 +23,7 @@ Task 7 is a software-only update. It does not add Wi-Fi, an app, database, real 
 - **Task 4:** Green LED feedback for granted entry, granted exit, and recognized Admin RFID.
 - **Task 5:** Three-attempt Lockdown Mode, Admin unlock, 60-second Admin Mode, and protected enrollment.
 - **Task 6:** GPIO13 servo door plus GPIO21/22 ultrasonic presence and safe automatic closing.
-- **Task 7:** Company C/D, users 5/6, per-user/per-area anti-passback, attendance masks, and occupancy counts.
+- **Task 7:** Company C/D, six mapped users, per-user/per-area anti-passback, attendance masks, and occupancy counts.
 
 ## Project Logic Contract
 
@@ -285,14 +285,15 @@ If the LCD is not detected, check its wiring and change `LCD_ADDRESS` to `0x3F`.
 
 | Command | Action |
 | --- | --- |
-| `1` | Select Main Entrance |
-| `2` | Select Company A |
-| `3` | Select Company B |
-| `4` | Select Server Room |
-| `5` | Select Management / Admin |
-| `6` | Select Company C |
-| `7` | Select Company D |
+| `1` | Select Company A |
+| `2` | Select Company B |
+| `3` | Select Company C |
+| `4` | Select Company D |
+| `5` | Select Server Room |
+| `6` | Select Management / Admin |
+| `7` | Select Main Entrance |
 | `E` | Enroll a fingerprint while Admin Mode is active |
+| `C` | Delete configured fingerprint IDs 1–6 after Admin Mode and exact `DELETE` confirmation |
 | `R` | Read a fingerprint and check permission |
 | `F` | Detect the 3.3 V AS608 / JM-101B over UART2 and print sensor parameters |
 | `P` | Simple timed fingerprint capture and database-match diagnostic |
@@ -376,9 +377,9 @@ Command `V` runs isolated mini tests without scanning RFID, capturing a fingerpr
 - LCD 16x2 sizing, 16-character trimming, and duplicate-screen refresh suppression;
 - attendance commit only after door state `OPEN`, servo angles, and the five-second/clear-area door-closing rules;
 - 20 cm presence calculations and the different Entry/Exit ultrasonic policies;
-- the AS608/JM-101B model, 3.3 V/about-60 mA profile, fingerprint UART2/pin/57600 contract, simple servo attach default, servo GPIO13 versus RFID SCK GPIO18, Serial command uniqueness including `W`, area mappings, and GPIO conflicts.
+- the AS608/JM-101B model, 3.3 V/about-60 mA profile, fingerprint UART2/pin/57600 contract, protected deletion of exactly IDs 1–6, simple servo attach default, servo GPIO13 versus RFID SCK GPIO18, Serial command uniqueness including `C` and `W`, area mappings, and GPIO conflicts.
 
-Before testing, the command snapshots attendance masks, selected area, Entry/Exit mode, lockdown, failed attempts, Admin Mode, enrollment state, door state/timer, ultrasonic cache, presence-prompt state, and cached LCD text/timestamp. It restores that state before returning. A failed test prints its name, expected value, and actual value, followed by a complete summary.
+Before testing, the command snapshots attendance masks, selected area, Entry/Exit mode, lockdown, failed attempts, Admin Mode, enrollment/delete-confirmation state, door state/timer, ultrasonic cache, presence-prompt state, and cached LCD text/timestamp. It restores that state before returning. A failed test prints its name, expected value, and actual value, followed by a complete summary.
 
 Attendance is now committed only after an authorized servo-open command reaches the software `OPEN` state. If PWM attachment or door opening fails, occupancy and the failed-attempt counter remain unchanged.
 
@@ -427,12 +428,19 @@ The normal access flow opens the servo only after granted entry or exit. Command
 | --- | --- | --- |
 | 1 | Employee A | Main Entrance, Company A |
 | 2 | Employee B | Main Entrance, Company B |
-| 3 | IT Admin | Main Entrance, Server Room |
-| 4 | Manager | All areas |
-| 5 | Employee C | Main Entrance, Company C |
-| 6 | Employee D | Main Entrance, Company D |
+| 3 | Employee C | Main Entrance, Company C |
+| 4 | Employee D | Main Entrance, Company D |
+| 5 | IT Admin | Main Entrance, Server Room |
+| 6 | Manager | All areas |
+
+The seven `insideMask` bits follow the same order as commands `1` through `7`: Company A, Company B, Company C, Company D, Server Room, Management/Admin, and Main Entrance.
 
 Enroll a physical fingerprint using one of these IDs to test its matching permission profile. IDs from 7 through 127 can be stored in the sensor, but access will be denied until a matching user is added to the local `users` array.
+
+To clear the six configured sensor slots for re-enrollment, scan the Admin RFID,
+send `C`, and then send exactly `DELETE`. The command calls `deleteModel()` only
+for IDs 1–6; it does not clear other slots or change users, permissions, attendance,
+the selected area, access mode, failed attempts, or the door.
 
 ## Configure the Admin Master Card
 
@@ -473,14 +481,14 @@ The RFID admin identity is separate from fingerprint users. It enables Admin Mod
 3. Send `P`; place a finger within 15 seconds and verify capture, conversion, ID, and confidence output without access or door actions.
 4. Send `U`; verify ten readings, the valid-reading count, average distance, and `Person Near` result.
 5. Send `D`; verify the servo sequence 0° → 90° → 0°. If commands print but the motor does not move, check 5 V power and common GND. The command is blocked during lockdown.
-6. Select area `2` and send `R` while nobody is near; expect `ENTRY BLOCKED`, no fingerprint capture, no servo movement, and no failed attempt.
+6. Select area `1` and send `R` while nobody is near; expect `ENTRY BLOCKED`, no fingerprint capture, no servo movement, and no failed attempt.
 7. Stand within 20 cm, send `R`, and use fingerprint ID 1; expect granted entry and the door to open.
 8. Remain near after five seconds; verify the door stays open. Move clear and verify it closes.
-9. Select area `3`, stand near, send `R`, and use fingerprint ID 1; expect denial, a failed attempt, and no servo movement.
-10. After test 7 closes the door, repeat area `2` entry with ID 1; expect `Already Inside`, denial feedback, one failed attempt, and no servo movement.
-11. Select area `2`, send `X`, then `R` and fingerprint ID 1 without ultrasonic presence; expect granted exit, `OUTSIDE`, and the door to open.
+9. Select area `2`, stand near, send `R`, and use fingerprint ID 1; expect denial, a failed attempt, and no servo movement.
+10. After test 7 closes the door, repeat area `1` entry with ID 1; expect `Already Inside`, denial feedback, one failed attempt, and no servo movement.
+11. Select area `1`, send `X`, then `R` and fingerprint ID 1 without ultrasonic presence; expect granted exit, `OUTSIDE`, and the door to open.
 12. Repeat that exit after the door closes; expect `Exit Denied / Not Inside`, no servo movement, and no failed-attempt increase.
-13. Select area `6`, stand near, and use fingerprint ID 5; expect Employee C to enter Company C. Select area `7` with the same user for entry and expect a permission denial.
+13. Select area `3`, stand near, and use fingerprint ID 3; expect Employee C to enter Company C. Select area `4` with the same user for entry and expect a permission denial.
 14. Send `S`; verify all six users and occupancy counts for Main Entrance, Companies A-D, Server Room, and Management/Admin.
 15. Trigger lockdown and confirm both Entry and Exit Mode are blocked. Scan Admin RFID and confirm unlock feedback without servo movement.
 

@@ -34,12 +34,35 @@ Open:
 - `http://127.0.0.1:8000/docs` for FastAPI's generated documentation
 
 The server creates and seeds `smart_office.db` on startup. Seeding is idempotent, so restarting the server does not duplicate data.
+The seed also synchronizes the fixed development mapping in place and resets
+per-area attendance only when it detects a user/area mapping migration.
 
 The database can also be initialized without starting the server:
 
 ```powershell
 python -m app.seed
 ```
+
+## Seeded access mapping
+
+| Fingerprint/User ID | User | Allowed area IDs |
+| ---: | --- | --- |
+| 1 | Employee A | 1, 7 |
+| 2 | Employee B | 2, 7 |
+| 3 | Employee C | 3, 7 |
+| 4 | Employee D | 4, 7 |
+| 5 | IT Admin | 5, 7 |
+| 6 | Manager | 1–7 |
+
+| Area ID | Area |
+| ---: | --- |
+| 1 | Company A |
+| 2 | Company B |
+| 3 | Company C |
+| 4 | Company D |
+| 5 | Server Room |
+| 6 | Management / Admin |
+| 7 | Main Entrance |
 
 ## Current API scope
 
