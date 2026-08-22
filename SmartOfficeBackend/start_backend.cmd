@@ -8,6 +8,17 @@ if not exist ".venv\Scripts\python.exe" (
   exit /b 1
 )
 
+if exist ".env" (
+  for /f "usebackq eol=# tokens=1,* delims==" %%A in (".env") do (
+    if /i "%%A"=="SMART_OFFICE_API_TOKEN" set "SMART_OFFICE_API_TOKEN=%%B"
+  )
+)
+if not defined SMART_OFFICE_API_TOKEN (
+  echo ERROR: SMART_OFFICE_API_TOKEN is not configured.
+  echo Add it to the ignored SmartOfficeBackend\.env file.
+  exit /b 1
+)
+
 netstat -ano | findstr /R /C:":8000 .*LISTENING" >nul
 if not errorlevel 1 (
   echo Port 8000 is already in use. No second backend was started.

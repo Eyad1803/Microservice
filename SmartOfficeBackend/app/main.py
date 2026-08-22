@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import os
+import secrets
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
 from sqlalchemy import and_, func, text
 from sqlalchemy.engine import Engine
 from sqlmodel import Session, select
@@ -36,6 +39,9 @@ from app.schemas import (
 )
 from app.seed import initialize_database
 
+API_TOKEN_ENV_VAR = "SMART_OFFICE_API_TOKEN"
+MINIMUM_API_TOKEN_LENGTH = 32
+
 
 def create_app(
     *,
@@ -43,9 +49,19 @@ def create_app(
     database_path: Path = DATABASE_PATH,
     runtime: SingleStationRuntime | None = None,
     initialize_on_startup: bool = True,
+    require_api_auth: bool = False,
+    api_token: str | None = None,
 ) -> FastAPI:
     station_runtime = runtime or SingleStationRuntime()
     access_service = AccessService(target_engine, station_runtime)
+    configured_api_token = api_token.strip() if api_token else ""
+    if require_api_auth and configured_api_token and (
+        len(configured_api_token) < MINIMUM_API_TOKEN_LENGTH
+    ):
+        raise ValueError(
+            f"{API_TOKEN_ENV_VAR} must contain at least "
+            f"{MINIMUM_API_TOKEN_LENGTH} characters"
+        )
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
@@ -57,6 +73,44 @@ def create_app(
     application = FastAPI(title="Smart Office Backend", lifespan=lifespan)
     application.state.access_runtime = station_runtime
     application.state.access_service = access_service
+
+    @application.middleware("http")
+    async def require_bearer_token(request: Request, call_next):
+        public_paths = {"/", "/api/health"}
+        if not require_api_auth or request.url.path in public_paths:
+            return await call_next(request)
+
+        if not configured_api_token:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "detail": {
+                        "reason_code": "API_AUTH_NOT_CONFIGURED",
+                        "message": "Smart Office API authentication is not configured.",
+                    }
+                },
+            )
+
+        authorization = request.headers.get("authorization", "")
+        scheme, separator, supplied_token = authorization.partition(" ")
+        authorized = (
+            separator == " "
+            and scheme.lower() == "bearer"
+            and bool(supplied_token)
+            and secrets.compare_digest(supplied_token, configured_api_token)
+        )
+        if not authorized:
+            return JSONResponse(
+                status_code=401,
+                content={
+                    "detail": {
+                        "reason_code": "UNAUTHORIZED",
+                        "message": "A valid Smart Office bearer token is required.",
+                    }
+                },
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        return await call_next(request)
 
     @application.get("/")
     def read_root() -> dict[str, str]:
@@ -236,4 +290,7 @@ def create_app(
     return application
 
 
-app = create_app()
+app = create_app(
+    require_api_auth=True,
+    api_token=os.environ.get(API_TOKEN_ENV_VAR),
+)

@@ -13,6 +13,7 @@ import type {
 } from '../types/smart-office';
 
 const configuredApiBaseUrl = process.env.EXPO_PUBLIC_API_BASE_URL;
+const configuredApiToken = process.env.EXPO_PUBLIC_SMART_OFFICE_API_TOKEN;
 const requestTimeoutMs = 10_000;
 
 type SystemStateDto = {
@@ -133,6 +134,18 @@ function getApiBaseUrl(): string {
   return apiBaseUrl;
 }
 
+function getApiToken(): string {
+  const apiToken = configuredApiToken?.trim();
+
+  if (!apiToken) {
+    throw new ApiError(
+      'Smart Office API authentication is not configured. Set EXPO_PUBLIC_SMART_OFFICE_API_TOKEN and reload the app.',
+    );
+  }
+
+  return apiToken;
+}
+
 function parseErrorDetail(body: ErrorResponseDto): {
   message: string | null;
   reasonCode?: AccessReasonCode;
@@ -168,6 +181,7 @@ async function request<T>(
       method: options.method ?? 'GET',
       headers: {
         Accept: 'application/json',
+        Authorization: `Bearer ${getApiToken()}`,
         ...(options.body ? { 'Content-Type': 'application/json' } : {}),
       },
       body: options.body ? JSON.stringify(options.body) : undefined,

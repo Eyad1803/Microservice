@@ -14,7 +14,8 @@ from app.schemas import Direction, ReasonCode, RequestStatus
 
 HEARTBEAT_EXPECTED_SECONDS = 2
 ESP32_OFFLINE_TIMEOUT_SECONDS = 6
-ACCESS_REQUEST_TTL_SECONDS = 30
+ACCESS_REQUEST_TTL_SECONDS = 60
+IN_PROGRESS_TTL_SECONDS = 45
 RECENT_TERMINAL_LIMIT = 32
 
 
@@ -150,6 +151,9 @@ class SingleStationRuntime:
             ):
                 request.status = RequestStatus.IN_PROGRESS
                 request.updated_at = received_at
+                request.expires_at = received_at + timedelta(
+                    seconds=IN_PROGRESS_TTL_SECONDS
+                )
 
     def station_snapshot(self) -> StationSnapshot:
         now = self.now()

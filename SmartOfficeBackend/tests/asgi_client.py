@@ -26,6 +26,7 @@ async def _request(
     method: str,
     target: str,
     json_body: Any | None,
+    request_headers: dict[str, str] | None,
 ) -> ASGIResponse:
     parsed = urlsplit(target)
     body = b"" if json_body is None else json.dumps(json_body).encode("utf-8")
@@ -45,6 +46,11 @@ async def _request(
     headers = [(b"accept", b"application/json")]
     if json_body is not None:
         headers.append((b"content-type", b"application/json"))
+    if request_headers:
+        headers.extend(
+            (key.lower().encode("latin-1"), value.encode("latin-1"))
+            for key, value in request_headers.items()
+        )
     scope = {
         "type": "http",
         "asgi": {"version": "3.0", "spec_version": "2.3"},
@@ -78,5 +84,6 @@ def request(
     method: str,
     target: str,
     json_body: Any | None = None,
+    headers: dict[str, str] | None = None,
 ) -> ASGIResponse:
-    return asyncio.run(_request(app, method, target, json_body))
+    return asyncio.run(_request(app, method, target, json_body, headers))

@@ -130,8 +130,10 @@ void loop() {
 #if SMART_OFFICE_MODE == INTEGRATED_MODE
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
+#include <NetworkClientSecure.h>
 #include <WiFi.h>
 #include <esp_system.h>
+#include <time.h>
 
 #if __has_include("secrets.h")
 #include "secrets.h"
@@ -139,8 +141,9 @@ void loop() {
 #error "INTEGRATED_MODE requires secrets.h. Copy secrets.example.h to secrets.h and fill the local values."
 #endif
 
-#if !defined(WIFI_SSID) || !defined(WIFI_PASSWORD) || !defined(BACKEND_BASE_URL)
-#error "secrets.h must define WIFI_SSID, WIFI_PASSWORD, and BACKEND_BASE_URL."
+#if !defined(WIFI_SSID) || !defined(WIFI_PASSWORD) || !defined(BACKEND_BASE_URL) || \
+    !defined(SMART_OFFICE_API_TOKEN) || !defined(SMART_OFFICE_TLS_ROOT_CA)
+#error "secrets.h must define Wi-Fi, Backend URL, API token, and TLS root CA values."
 #endif
 #endif
 
@@ -430,10 +433,16 @@ constexpr unsigned long HEARTBEAT_INTERVAL_MS = 2000;
 constexpr unsigned long REMOTE_REQUEST_STATUS_INTERVAL_MS = 2000;
 constexpr unsigned long ACCESS_CHECK_RETRY_INTERVAL_MS = 2000;
 constexpr unsigned long COMPLETION_RETRY_INTERVAL_MS = 2000;
+constexpr unsigned long REMOTE_FINGERPRINT_CAPTURE_TIMEOUT_MS = 25000;
 constexpr unsigned long BACKEND_RETRY_INTERVAL_MS = 5000;
 constexpr unsigned long BACKEND_FAILURE_LOG_INTERVAL_MS = 15000;
-constexpr uint16_t HTTP_CONNECT_TIMEOUT_MS = 1000;
-constexpr uint16_t HTTP_RESPONSE_TIMEOUT_MS = 1500;
+constexpr unsigned long BACKEND_SUSTAINED_OUTAGE_MS = 18000;
+constexpr unsigned long BACKEND_ACCESS_FRESHNESS_MS = 10000;
+constexpr unsigned long TLS_CLOCK_WAIT_LOG_INTERVAL_MS = 10000;
+constexpr uint16_t HTTP_CONNECT_TIMEOUT_MS = 4000;
+constexpr uint16_t HTTP_RESPONSE_TIMEOUT_MS = 7000;
+constexpr uint8_t BACKEND_TRANSIENT_FAILURE_LIMIT = 3;
+constexpr time_t TLS_MINIMUM_VALID_EPOCH = 1704067200;
 constexpr size_t EXPECTED_BOOTSTRAP_ATTENDANCE_ROWS = USER_COUNT * 7;
 
 IntegrationSyncState integrationSyncState = INTEGRATION_UNSYNCED;
@@ -449,12 +458,16 @@ bool wifiWasConnected = false;
 bool backendReachable = false;
 bool backendSystemActive = false;
 bool backendAdminMode = false;
+bool tlsClockSyncStarted = false;
+uint8_t consecutiveBackendFailures = 0;
 unsigned long wifiConnectionAttemptStartedAt = 0;
 unsigned long wifiRetryScheduledAt = 0;
+unsigned long lastTlsClockWaitLogAt = 0;
 unsigned long lastHeartbeatAttemptAt = 0;
 unsigned long lastRemoteRequestStatusCheckAt = 0;
 unsigned long lastBackendSyncAttemptAt = 0;
 unsigned long lastBackendFailureLogAt = 0;
+unsigned long lastBackendSuccessAt = 0;
 #endif
 
 void setup();
@@ -490,6 +503,13 @@ void scheduleWiFiRetry();
 String getWiFiStatusName(wl_status_t status);
 String generateBootId();
 String buildBackendUrl(const char* path);
+bool backendUsesHttps();
+bool serviceTlsClock();
+bool beginBackendHttpRequest(HTTPClient& http,
+                             WiFiClient& plainClient,
+                             NetworkClientSecure& secureClient,
+                             const String& url);
+void addBackendAuthorization(HTTPClient& http);
 bool sendHeartbeat();
 bool fetchBootstrap();
 bool postJson(const char* path,
@@ -557,6 +577,8 @@ bool parseCanonicalSecurity(JsonDocument& document,
                             bool& canonicalAdminMode);
 void mirrorCanonicalSecurity(int canonicalFailedAttempts,
                              bool canonicalLockdown);
+bool backendRecentlyConfirmed();
+void recordBackendSuccess(const String& operation);
 void markBackendUnavailable(const String& operation, int responseCode);
 void setIntegrationSyncState(IntegrationSyncState newState);
 String getIntegrationSyncStateName(IntegrationSyncState state);
@@ -1005,6 +1027,61 @@ String buildBackendUrl(const char* path) {
   return baseUrl + path;
 }
 
+bool backendUsesHttps() {
+  return String(BACKEND_BASE_URL).startsWith("https://");
+}
+
+bool serviceTlsClock() {
+  if (!backendUsesHttps()) {
+    return true;
+  }
+
+  if (time(nullptr) >= TLS_MINIMUM_VALID_EPOCH) {
+    if (tlsClockSyncStarted) {
+      Serial.println("[TLS] Trusted clock synchronized; certificate validation enabled.");
+      tlsClockSyncStarted = false;
+      lastBackendSyncAttemptAt = 0;
+    }
+    return true;
+  }
+
+  unsigned long now = millis();
+  if (!tlsClockSyncStarted) {
+    configTime(0, 0, "time.cloudflare.com", "pool.ntp.org");
+    tlsClockSyncStarted = true;
+    lastTlsClockWaitLogAt = now;
+    Serial.println("[TLS] Waiting for trusted network time before HTTPS...");
+  } else if (now - lastTlsClockWaitLogAt >= TLS_CLOCK_WAIT_LOG_INTERVAL_MS) {
+    lastTlsClockWaitLogAt = now;
+    Serial.println("[TLS] Still waiting for trusted network time; HTTPS remains blocked.");
+  }
+  return false;
+}
+
+bool beginBackendHttpRequest(HTTPClient& http,
+                             WiFiClient& plainClient,
+                             NetworkClientSecure& secureClient,
+                             const String& url) {
+  if (url.startsWith("https://")) {
+    if (strlen(SMART_OFFICE_TLS_ROOT_CA) == 0) {
+      Serial.println("[BACKEND] HTTPS blocked: TLS root CA is not configured.");
+      return false;
+    }
+    secureClient.setCACert(SMART_OFFICE_TLS_ROOT_CA);
+    return http.begin(secureClient, url);
+  }
+  if (url.startsWith("http://")) {
+    return http.begin(plainClient, url);
+  }
+  Serial.println("[BACKEND] Unsupported URL scheme; use http:// or https://.");
+  return false;
+}
+
+void addBackendAuthorization(HTTPClient& http) {
+  http.addHeader(
+      "Authorization", String("Bearer ") + SMART_OFFICE_API_TOKEN);
+}
+
 String getIntegrationSyncStateName(IntegrationSyncState state) {
   switch (state) {
     case INTEGRATION_SYNCED:
@@ -1078,6 +1155,10 @@ void setupNetworkIntegration() {
   serialCreatedRequestArea = AREA_NONE;
   serialCreatedRequestDirection = MODE_ENTRY;
   lastRemoteRequestStatusCheckAt = 0;
+  tlsClockSyncStarted = false;
+  lastTlsClockWaitLogAt = 0;
+  consecutiveBackendFailures = 0;
+  lastBackendSuccessAt = 0;
 
   Serial.println("[INTEGRATION] Mode: INTEGRATED");
   Serial.print("[INTEGRATION] Boot ID: ");
@@ -1102,6 +1183,8 @@ void serviceNetworkIntegration() {
       Serial.println("[WIFI] Disconnected");
       wifiWasConnected = false;
       backendReachable = false;
+      consecutiveBackendFailures = 0;
+      lastBackendSuccessAt = 0;
       setIntegrationSyncState(INTEGRATION_UNSYNCED);
       WiFi.disconnect(false, false);
       scheduleWiFiRetry();
@@ -1141,6 +1224,8 @@ void serviceNetworkIntegration() {
     wifiConnectionState = WIFI_CONNECTION_CONNECTED;
     wifiWasConnected = true;
     backendReachable = false;
+    consecutiveBackendFailures = 0;
+    lastBackendSuccessAt = 0;
     lastBackendSyncAttemptAt = 0;
     lastHeartbeatAttemptAt = 0;
     Serial.println("[WIFI] Connected");
@@ -1150,6 +1235,13 @@ void serviceNetworkIntegration() {
     Serial.print(WiFi.RSSI());
     Serial.println(" dBm");
     Serial.println("[BACKEND] Synchronizing...");
+    if (backendUsesHttps()) {
+      Serial.println("[TLS] HTTPS configured; certificate validation requires trusted time.");
+    }
+  }
+
+  if (!serviceTlsClock()) {
+    return;
   }
 
   if (integrationSyncState == INTEGRATION_UNSYNCED) {
@@ -1190,15 +1282,18 @@ bool postJson(const char* path,
     return false;
   }
 
-  WiFiClient client;
+  WiFiClient plainClient;
+  NetworkClientSecure secureClient;
   HTTPClient http;
   http.setConnectTimeout(HTTP_CONNECT_TIMEOUT_MS);
   http.setTimeout(HTTP_RESPONSE_TIMEOUT_MS);
   http.setReuse(false);
-  if (!http.begin(client, buildBackendUrl(path))) {
+  String url = buildBackendUrl(path);
+  if (!beginBackendHttpRequest(http, plainClient, secureClient, url)) {
     return false;
   }
 
+  addBackendAuthorization(http);
   http.addHeader("Content-Type", "application/json");
   responseCode = http.POST(requestBody);
   if (responseCode > 0) {
@@ -1217,15 +1312,18 @@ bool getJson(const char* path,
     return false;
   }
 
-  WiFiClient client;
+  WiFiClient plainClient;
+  NetworkClientSecure secureClient;
   HTTPClient http;
   http.setConnectTimeout(HTTP_CONNECT_TIMEOUT_MS);
   http.setTimeout(HTTP_RESPONSE_TIMEOUT_MS);
   http.setReuse(false);
-  if (!http.begin(client, buildBackendUrl(path))) {
+  String url = buildBackendUrl(path);
+  if (!beginBackendHttpRequest(http, plainClient, secureClient, url)) {
     return false;
   }
 
+  addBackendAuthorization(http);
   responseCode = http.GET();
   if (responseCode > 0) {
     responseBody = http.getString();
@@ -1678,7 +1776,7 @@ void serviceRemoteFingerprintWorkflow() {
     Serial.println(remoteAccessRequest.requestId);
     Serial.print("Direction: ");
     Serial.println(getAccessModeName(remoteAccessRequest.direction));
-    Serial.println("Place one finger on the sensor (15 second timeout).");
+    Serial.println("Place one finger on the sensor (25 second timeout).");
     lcdShowPlaceFinger();
     presencePromptVisible = false;
     return;
@@ -1686,7 +1784,7 @@ void serviceRemoteFingerprintWorkflow() {
 
   if (state == REMOTE_FINGERPRINT_WAITING_FOR_FINGER) {
     if (millis() - remoteAccessRequest.scanStartedAt >=
-        FINGERPRINT_CAPTURE_TIMEOUT_MS) {
+        REMOTE_FINGERPRINT_CAPTURE_TIMEOUT_MS) {
       prepareRemoteAccessCheckPayload("TIMEOUT");
       return;
     }
@@ -1765,7 +1863,9 @@ void serviceRemoteFingerprintWorkflow() {
                           responseCode,
                           HTTP_CODE_OK);
   if (checked) {
-    handleRemoteAccessCheckResponse(responseBody);
+    if (handleRemoteAccessCheckResponse(responseBody)) {
+      recordBackendSuccess("Access check");
+    }
     return;
   }
 
@@ -2006,7 +2106,9 @@ void serviceRemoteDoorCompletionWorkflow() {
                             responseCode,
                             HTTP_CODE_OK);
   if (completed) {
-    handleRemoteCompletionResponse(responseBody);
+    if (handleRemoteCompletionResponse(responseBody)) {
+      recordBackendSuccess("Access completion");
+    }
     return;
   }
 
@@ -2052,9 +2154,10 @@ void createIntegratedSerialAccessRequest() {
   }
   if (integrationSyncState != INTEGRATION_SYNCED ||
       !backendReachable || WiFi.status() != WL_CONNECTED ||
+      !backendRecentlyConfirmed() ||
       pendingAuthorizationId.length() > 0) {
     Serial.println("[ACCESS REQUEST BLOCKED]");
-    Serial.println("Integrated Backend is not SYNCED and ready.");
+    Serial.println("Integrated Backend is not recently confirmed and ready.");
     returnToEntryMode();
     return;
   }
@@ -2126,6 +2229,7 @@ void createIntegratedSerialAccessRequest() {
     return;
   }
 
+  recordBackendSuccess("Access request creation");
   serialCreatedRequestId = canonicalRequestId;
   serialCreatedRequestArea = selectedArea;
   serialCreatedRequestDirection = requestedDirection;
@@ -2209,6 +2313,7 @@ void serviceRemoteRequestStatus() {
   int responseCode = -1;
   bool statusAvailable = getJson(path.c_str(), responseBody, responseCode);
   if (responseCode == HTTP_CODE_GONE) {
+    recordBackendSuccess("Request status");
     if (pendingAuthorizationId.length() == 0 &&
         integrationSyncState != INTEGRATION_RECONCILIATION_REQUIRED) {
       clearTrackedRemoteRequest(trackedRequestId, "EXPIRED");
@@ -2240,6 +2345,7 @@ void serviceRemoteRequestStatus() {
   }
 
   if (status == "QUEUED" || status == "IN_PROGRESS") {
+    recordBackendSuccess("Request status");
     if (remoteAccessRequest.active &&
         remoteAccessRequest.workflowState == REMOTE_ACCESS_CHECK_STATUS &&
         remoteAccessRequest.accessCheckPayload.length() > 0) {
@@ -2249,6 +2355,7 @@ void serviceRemoteRequestStatus() {
     return;
   }
   if (status == "AUTHORIZED_WAITING_DOOR") {
+    recordBackendSuccess("Request status");
     pendingAuthorizationId = trackedRequestId;
     if (remoteAccessRequest.active) {
       remoteAccessRequest.liveAuthorizationReceived = false;
@@ -2262,6 +2369,7 @@ void serviceRemoteRequestStatus() {
   }
   if (status == "GRANTED" || status == "DENIED" ||
       status == "FAILED" || status == "EXPIRED") {
+    recordBackendSuccess("Request status");
     clearTrackedRemoteRequest(trackedRequestId, status);
     return;
   }
@@ -2299,8 +2407,63 @@ void mirrorCanonicalSecurity(int canonicalFailedAttempts,
   failedAttempts = canonicalFailedAttempts;
 }
 
+void recordBackendSuccess(const String& operation) {
+  if (consecutiveBackendFailures > 0) {
+    Serial.print("[BACKEND] ");
+    Serial.print(operation);
+    Serial.println(" recovered");
+    Serial.println("[BACKEND] Transient failure counter reset.");
+  }
+  consecutiveBackendFailures = 0;
+  lastBackendSuccessAt = millis();
+  lastBackendFailureLogAt = 0;
+  backendReachable = true;
+}
+
+bool backendRecentlyConfirmed() {
+  return backendReachable && lastBackendSuccessAt != 0 &&
+         millis() - lastBackendSuccessAt <= BACKEND_ACCESS_FRESHNESS_MS;
+}
+
 void markBackendUnavailable(const String& operation, int responseCode) {
   unsigned long now = millis();
+  bool mayRemainCanonical = responseCode < 0 && backendReachable &&
+                            integrationSyncState != INTEGRATION_UNSYNCED;
+  if (mayRemainCanonical) {
+    if (consecutiveBackendFailures < BACKEND_TRANSIENT_FAILURE_LIMIT) {
+      ++consecutiveBackendFailures;
+    }
+    bool failureLimitReached =
+        consecutiveBackendFailures >= BACKEND_TRANSIENT_FAILURE_LIMIT;
+    bool outageWindowElapsed = lastBackendSuccessAt != 0 &&
+                               now - lastBackendSuccessAt >=
+                                   BACKEND_SUSTAINED_OUTAGE_MS;
+
+    Serial.print("[BACKEND] ");
+    Serial.print(operation);
+    Serial.print(" transient failure ");
+    Serial.print(consecutiveBackendFailures);
+    Serial.print('/');
+    Serial.print(BACKEND_TRANSIENT_FAILURE_LIMIT);
+    Serial.print(" (HTTP/code ");
+    Serial.print(responseCode);
+    if (responseCode == HTTPC_ERROR_READ_TIMEOUT) {
+      Serial.print(": response/read timeout");
+    } else if (responseCode == HTTPC_ERROR_CONNECTION_REFUSED) {
+      Serial.print(": connection refused");
+    }
+    Serial.println(')');
+
+    if (!failureLimitReached || !outageWindowElapsed) {
+      Serial.println("[BACKEND] Remaining in current canonical state within transport grace period.");
+      return;
+    }
+    Serial.println("[BACKEND] Sustained Backend connectivity loss.");
+    Serial.print("[WIFI] RSSI at loss: ");
+    Serial.print(WiFi.RSSI());
+    Serial.println(" dBm");
+  }
+
   bool shouldLog = backendReachable || lastBackendFailureLogAt == 0 ||
                    now - lastBackendFailureLogAt >=
                        BACKEND_FAILURE_LOG_INTERVAL_MS;
@@ -2422,10 +2585,7 @@ bool sendHeartbeat() {
     return false;
   }
 
-  if (!backendReachable) {
-    Serial.println("[BACKEND] Heartbeat restored");
-  }
-  backendReachable = true;
+  recordBackendSuccess("Heartbeat");
   return true;
 }
 
@@ -2537,8 +2697,6 @@ bool applyBootstrapResponse(const String& responseBody) {
   mirrorCanonicalSecurity(canonicalFailedAttempts, canonicalLockdown);
   backendSystemActive = canonicalSystemActive;
   backendAdminMode = canonicalAdminMode;
-  backendReachable = true;
-
   if (hasPendingAuthorization) {
     pendingAuthorizationId = receivedPendingId;
     if (remoteAccessRequest.active &&
@@ -2584,6 +2742,7 @@ bool fetchBootstrap() {
     return false;
   }
 
+  recordBackendSuccess("Bootstrap");
   lastHeartbeatAttemptAt = 0;
   return true;
 }

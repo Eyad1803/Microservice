@@ -62,11 +62,15 @@ function resultPresentation(status: AccessRequestLifecycle | null): {
 } {
   switch (status) {
     case 'QUEUED':
-      return { title: 'WAITING FOR ESP32', description: 'Access request queued.', tone: 'warning' };
+      return {
+        title: 'WAITING FOR ESP32',
+        description: 'Request sent. Do not place your finger until the station acknowledges it.',
+        tone: 'warning',
+      };
     case 'IN_PROGRESS':
       return {
-        title: 'WAITING FOR FINGERPRINT',
-        description: 'Follow the fingerprint prompt at the access station.',
+        title: 'PLACE FINGER',
+        description: 'ESP32 acknowledged the request. Place your finger on the sensor now.',
         tone: 'warning',
       };
     case 'AUTHORIZED_WAITING_DOOR':
@@ -322,7 +326,13 @@ export default function AccessScreen() {
         : 'UNAVAILABLE';
   const presenceTone: StatusTone =
     personDetected === true ? 'success' : personDetected === false ? 'warning' : 'neutral';
-  const presentation = resultPresentation(currentStatus);
+  const presentation = isCreatingRequest
+    ? {
+        title: 'SENDING REQUEST',
+        description: 'Sending the access request to the Backend…',
+        tone: 'warning' as const,
+      }
+    : resultPresentation(currentStatus);
   const resultArea = currentRequest
     ? areas?.find((area) => area.id === currentRequest.areaId) ?? null
     : null;
@@ -343,7 +353,11 @@ export default function AccessScreen() {
     ? 'Ready to send an access request.'
     : 'Complete the operational requirements above to start a scan.';
   if (backendError) actionExplanation = 'Backend disconnected. Retry or wait for reconnection.';
-  else if (ownedRequest) actionExplanation = 'This access request is currently in progress.';
+  else if (ownedRequest && currentStatus === 'QUEUED') {
+    actionExplanation = 'Request sent. Wait for ESP32 acknowledgement before placing your finger.';
+  } else if (ownedRequest && currentStatus === 'IN_PROGRESS') {
+    actionExplanation = 'ESP32 acknowledged the request. Place your finger on the sensor now.';
+  } else if (ownedRequest) actionExplanation = 'This access request is currently in progress.';
   else if (anotherRequestActive) actionExplanation = 'Another access request is in progress.';
   else if (systemState?.lockdownActive) actionExplanation = 'Scanning is disabled while Lockdown is active.';
 

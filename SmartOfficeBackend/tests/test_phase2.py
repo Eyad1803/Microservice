@@ -219,7 +219,12 @@ class RequestAndHeartbeatTests(Phase2TestCase):
         self.assertEqual(second.status_code, 409)
         self.assertEqual(second.json()["detail"]["reason_code"], "REQUEST_IN_PROGRESS")
         before = self.snapshot()
-        self.clock.advance(31)
+        self.clock.advance(59)
+        self.assertEqual(
+            self.api("GET", f"/api/access/requests/{request_id}").status_code,
+            200,
+        )
+        self.clock.advance(2)
         expired = self.api("GET", f"/api/access/requests/{request_id}")
         self.assertEqual(expired.status_code, 410)
         self.assertEqual(expired.json()["detail"]["reason_code"], "REQUEST_EXPIRED")
@@ -239,6 +244,51 @@ class RequestAndHeartbeatTests(Phase2TestCase):
         self.assertIsNone(stale["person_detected"])
         self.assertIsNone(stale["distance_cm"])
         self.assertIsNone(stale["fingerprint_ready"])
+
+    def test_late_delivery_gets_one_finite_in_progress_deadline(self) -> None:
+        self.heartbeat()
+        created = self.create_request().json()
+        request_id = created["request_id"]
+
+        self.clock.advance(59)
+        self.assertEqual(
+            self.heartbeat(active_request_id=request_id).status_code,
+            200,
+        )
+        acknowledged = self.api(
+            "GET", f"/api/access/requests/{request_id}"
+        ).json()
+        self.assertEqual(acknowledged["status"], "IN_PROGRESS")
+        acknowledged_at = datetime.fromisoformat(acknowledged["updated_at"])
+        processing_deadline = datetime.fromisoformat(acknowledged["expires_at"])
+        self.assertEqual(
+            processing_deadline - acknowledged_at,
+            timedelta(seconds=45),
+        )
+
+        self.clock.advance(40)
+        polled = self.api("GET", f"/api/access/requests/{request_id}")
+        self.assertEqual(polled.status_code, 200)
+        self.assertEqual(polled.json()["expires_at"], acknowledged["expires_at"])
+
+        self.assertEqual(
+            self.heartbeat(active_request_id=request_id).status_code,
+            200,
+        )
+        after_heartbeat = self.api(
+            "GET", f"/api/access/requests/{request_id}"
+        )
+        self.assertEqual(after_heartbeat.status_code, 200)
+        self.assertEqual(
+            after_heartbeat.json()["expires_at"], acknowledged["expires_at"]
+        )
+
+        self.clock.advance(6)
+        expired = self.api("GET", f"/api/access/requests/{request_id}")
+        self.assertEqual(expired.status_code, 410)
+        self.assertEqual(expired.json()["detail"]["reason_code"], "REQUEST_EXPIRED")
+        self.assertEqual(self.scalar("SELECT failed_attempts FROM SystemState"), 0)
+        self.assertEqual(self.scalar("SELECT COUNT(*) FROM AccessLogs"), 0)
 
     def test_command_redelivery_acknowledgement_and_duplicate_heartbeat(self) -> None:
         self.heartbeat()
